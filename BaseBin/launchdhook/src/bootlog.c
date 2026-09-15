@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <stdarg.h>
 #include <ctype.h>
 #include <pthread.h>
@@ -15,6 +16,8 @@
 #include <dlfcn.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
+#include <mach/mach_time.h>
+#include <dispatch/dispatch.h>
 
 // main.m
 extern void exec_with_asl_disabled(void (^block)(void));
@@ -38,48 +41,95 @@ static proc_kmsgbuf_t resolve_proc_kmsgbuf(void)
 // Tunables
 // ---------------------------------------------------------------------------
 
-// Maximum characters kept per visual row (lines longer than the screen wrap)
-#define BOOTLOG_MAX_COLS 512
+// Longest line we keep (longer input is cut)
+#define BOOTLOG_MAX_LINE_LEN 1024
+// Lines kept for the log file (oldest are dropped beyond this)
+#define BOOTLOG_MAX_HISTORY 4096
 
 // Where the log is stashed across the launchd re-exec
 #define BOOTLOG_PERSIST_PATH "/private/var/tmp/.dopamine_bootlog"
 // Ignore a stashed log older than this (seconds), it is from another boot
 #define BOOTLOG_PERSIST_MAX_AGE 180
 
+// Where the complete log of the last userspace reboot ends up
+#define BOOTLOG_LOGFILE_DIR "/var/mobile/Library/Logs/Dopamine"
+#define BOOTLOG_LOGFILE_PATH BOOTLOG_LOGFILE_DIR "/bootlog.txt"
+
 // Size of the buffer used to read the kernel message buffer
 #define BOOTLOG_KMSG_BUFSIZE (256 * 1024)
 // How many dmesg lines to show initially
 #define BOOTLOG_KMSG_INITIAL_LINES 24
-// Minimum interval between two dmesg polls (nanoseconds)
-#define BOOTLOG_KMSG_POLL_INTERVAL_NS (150ull * 1000 * 1000)
+// Minimum interval between two dmesg polls
+#define BOOTLOG_KMSG_POLL_INTERVAL_NS (150ull * NSEC_PER_MSEC)
+
+// Framebuffer swaps are coalesced to at most one per this interval
+#define BOOTLOG_FLUSH_INTERVAL_NS (40ull * NSEC_PER_MSEC)
+
+// Safety net: the log stops itself after this many seconds no matter what,
+// so it can never keep painting over SpringBoard
+#define BOOTLOG_WATCHDOG_SECONDS 120
+
+// ---------------------------------------------------------------------------
+// Colors
+// ---------------------------------------------------------------------------
 
 // Framebuffer pixel format is 32 bit BGRA little endian -> 0xAARRGGBB as uint32
-#define BOOTLOG_COLOR_BG      0xFF000000u
-#define BOOTLOG_COLOR_TEXT    0xFFFFFFFFu
-#define BOOTLOG_COLOR_KERNEL  0xFFB4B4B4u
-#define BOOTLOG_COLOR_HEADER  0xFF9CC4FFu
+enum bootlog_color {
+	COL_BG = 0,        // black
+	COL_DIM,           // timestamps
+	COL_TEXT,          // plain launchd text
+	COL_KERNEL,        // kernel messages
+	COL_KERNEL_TAG,    // "Subsystem:" prefix of kernel messages
+	COL_HEADER,        // kernel banner / hardware info
+	COL_TAG_LAUNCHD,   // "launchd[1]:"
+	COL_TAG_DOPAMINE,  // "Dopamine:"
+	COL_LABEL,         // launchd labels and executable paths
+	COL_MILESTONE,     // reboot / re-exec / handover lines
+	COL_WARN,
+	COL_ERROR,
+	COL_COUNT
+};
 
-// Row types (also used as the first byte of each persisted line)
-#define BOOTLOG_ROW_TEXT   'T'
-#define BOOTLOG_ROW_KERNEL 'K'
-#define BOOTLOG_ROW_HEADER 'H'
+static const uint32_t gPalette[COL_COUNT] = {
+	[COL_BG]           = 0xFF000000u,
+	[COL_DIM]          = 0xFF7A7A7Au,
+	[COL_TEXT]         = 0xFFE8E8E8u,
+	[COL_KERNEL]       = 0xFFB4B4B4u,
+	[COL_KERNEL_TAG]   = 0xFF9FD3E6u,
+	[COL_HEADER]       = 0xFF8CB8FFu,
+	[COL_TAG_LAUNCHD]  = 0xFF5FD7FFu,
+	[COL_TAG_DOPAMINE] = 0xFFD787FFu,
+	[COL_LABEL]        = 0xFF8CE68Cu,
+	[COL_MILESTONE]    = 0xFFFFD75Fu,
+	[COL_WARN]         = 0xFFFFD75Fu,
+	[COL_ERROR]        = 0xFFFF6B6Bu,
+};
+
+// Line categories (also the first byte of each persisted line)
+#define CAT_HEADER   'H'
+#define CAT_KERNEL   'K'
+#define CAT_LAUNCHD  'L'
+#define CAT_DOPAMINE 'D'
 // Persisted file only: the last kernel message that was already shown
-#define BOOTLOG_PERSIST_KMSG_ANCHOR 'A'
+#define PERSIST_KMSG_ANCHOR 'A'
 
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
 
-struct bootlog_row {
-	char type;
-	char text[BOOTLOG_MAX_COLS + 1];
+struct bootlog_line {
+	char category;
+	char *text;
 };
 
 static struct {
 	bool active;
 	bool persist;
+	uint32_t generation;  // bumped on every stop so stale dispatch blocks bail out
 
-	struct drawctx *ctx;
+	struct drawctx *ctx[2]; // two surfaces on the display, we alternate between them (double buffering)
+	int ctxCount;
+	int nextCtx;
 	uint32_t *shadow;     // CPU side copy of the framebuffer, copied over on flush
 	size_t shadowSize;
 	int fbWidth;
@@ -98,9 +148,13 @@ static struct {
 	int originX;          // pixel origin of the text grid (logical coordinates)
 	int originY;
 
-	struct bootlog_row *ring;
-	int ringHead;         // index of the oldest row
-	int ringCount;
+	struct bootlog_line *lines;  // everything logged since the start (tail is on screen)
+	int lineCount;
+	int lineCap;
+
+	bool dirty;           // shadow buffer needs re-rendering
+	bool flushPending;    // a deferred flush is scheduled
+	uint64_t lastFlush;
 
 	char *kmsgBuf;
 	char kmsgLastLine[256];
@@ -117,22 +171,23 @@ static uint64_t monotonic_ns(void)
 {
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+	return (uint64_t)ts.tv_sec * NSEC_PER_SEC + (uint64_t)ts.tv_nsec;
 }
 
-// Seconds since boot, like the timestamps in the real verbose boot
-static double uptime_seconds(void)
+// Same clock the kernel stamps its message buffer with (includes time spent
+// asleep), so our lines line up with the dmesg lines around them
+static uint64_t kernel_clock_ns(void)
 {
-	return (double)monotonic_ns() / 1e9;
-}
-
-static uint32_t color_for_type(char type)
-{
-	switch (type) {
-		case BOOTLOG_ROW_KERNEL: return BOOTLOG_COLOR_KERNEL;
-		case BOOTLOG_ROW_HEADER: return BOOTLOG_COLOR_HEADER;
-		default: return BOOTLOG_COLOR_TEXT;
+	static mach_timebase_info_data_t timebase;
+	if (timebase.denom == 0) {
+		mach_timebase_info(&timebase);
+		if (timebase.denom == 0) {
+			timebase.numer = 1;
+			timebase.denom = 1;
+		}
 	}
+	uint64_t t = mach_continuous_time();
+	return t * timebase.numer / timebase.denom;
 }
 
 static int sysctl_string(const char *name, char *out, size_t outSize)
@@ -148,6 +203,46 @@ static int sysctl_string(const char *name, char *out, size_t outSize)
 		out[--len] = '\0';
 	}
 	return 0;
+}
+
+static bool is_word_char(char c)
+{
+	return isalnum((unsigned char)c) != 0;
+}
+
+// Case insensitive search for `word` in `text` where the match must not be
+// glued to other letters/digits ("failed" matches "Failed updating", but not
+// "_failedCommand:0"). Returns the offset or -1.
+static int find_word(const char *text, const char *word)
+{
+	size_t wordLen = strlen(word);
+	size_t textLen = strlen(text);
+	if (wordLen == 0 || textLen < wordLen) return -1;
+	for (size_t i = 0; i + wordLen <= textLen; i++) {
+		if (strncasecmp(text + i, word, wordLen) != 0) continue;
+		if (i > 0 && is_word_char(text[i - 1])) continue;
+		if (i + wordLen < textLen && is_word_char(text[i + wordLen])) continue;
+		return (int)i;
+	}
+	return -1;
+}
+
+static bool line_looks_like_error(const char *text)
+{
+	static const char *words[] = { "panic", "error", "failed", "failure", "fault", "denied", "abort", "assert", "cannot" };
+	for (size_t i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
+		if (find_word(text, words[i]) >= 0) return true;
+	}
+	return false;
+}
+
+static bool line_looks_like_warning(const char *text)
+{
+	static const char *words[] = { "warn", "warning", "timeout", "timed out", "retry", "deprecated" };
+	for (size_t i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
+		if (find_word(text, words[i]) >= 0) return true;
+	}
+	return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -179,7 +274,7 @@ static inline void put_pixel(int lx, int ly, uint32_t color)
 			break;
 	}
 	if (px < 0 || py < 0 || px >= g.fbWidth || py >= g.fbHeight) return;
-	g.shadow[(size_t)py * g.fbStride + px] = color;
+	g.shadow[(size_t)py * (size_t)g.fbStride + (size_t)px] = color;
 }
 
 static void draw_cell(int col, int row, char ch, uint32_t fg)
@@ -189,6 +284,7 @@ static void draw_cell(int col, int row, char ch, uint32_t fg)
 		glyphIndex = ch - BOOTLOG_FONT_FIRST_CHAR;
 	}
 	const uint8_t *glyph = gBootlogFont[glyphIndex];
+	const uint32_t bg = gPalette[COL_BG];
 
 	int x0 = g.originX + col * g.cellWidth;
 	int y0 = g.originY + row * g.cellHeight;
@@ -201,9 +297,9 @@ static void draw_cell(int col, int row, char ch, uint32_t fg)
 			for (int sy = 0; sy < scale; sy++) {
 				int py = y0 + r * scale + sy;
 				if (py < 0 || py >= g.fbHeight) continue;
-				uint32_t *line = &g.shadow[(size_t)py * g.fbStride];
+				uint32_t *line = &g.shadow[(size_t)py * (size_t)g.fbStride];
 				for (int b = 0; b < BOOTLOG_FONT_WIDTH; b++) {
-					uint32_t color = (bits & (0x80 >> b)) ? fg : BOOTLOG_COLOR_BG;
+					uint32_t color = (bits & (0x80 >> b)) ? fg : bg;
 					int px = x0 + b * scale;
 					for (int sx = 0; sx < scale; sx++, px++) {
 						if (px >= 0 && px < g.fbWidth) line[px] = color;
@@ -217,7 +313,7 @@ static void draw_cell(int col, int row, char ch, uint32_t fg)
 	for (int r = 0; r < BOOTLOG_FONT_HEIGHT; r++) {
 		uint8_t bits = glyph[r];
 		for (int b = 0; b < BOOTLOG_FONT_WIDTH; b++) {
-			uint32_t color = (bits & (0x80 >> b)) ? fg : BOOTLOG_COLOR_BG;
+			uint32_t color = (bits & (0x80 >> b)) ? fg : bg;
 			for (int sy = 0; sy < scale; sy++) {
 				for (int sx = 0; sx < scale; sx++) {
 					put_pixel(x0 + b * scale + sx, y0 + r * scale + sy, color);
@@ -227,83 +323,259 @@ static void draw_cell(int col, int row, char ch, uint32_t fg)
 	}
 }
 
-// Render visual row `row` (0 = top of screen) from the ring buffer
-static void render_row(int row)
+// ---------------------------------------------------------------------------
+// Colorizer: assigns a palette index to every character of a line
+// ---------------------------------------------------------------------------
+
+static void fill_colors(uint8_t *colors, size_t from, size_t to, uint8_t color)
 {
-	const char *text = "";
-	uint32_t fg = BOOTLOG_COLOR_TEXT;
-	if (row < g.ringCount) {
-		struct bootlog_row *r = &g.ring[(g.ringHead + row) % g.rows];
-		text = r->text;
-		fg = color_for_type(r->type);
+	for (size_t i = from; i < to; i++) colors[i] = color;
+}
+
+static void colorize_line(const struct bootlog_line *line, uint8_t *colors, size_t len)
+{
+	const char *text = line->text;
+	size_t pos = 0;
+
+	uint8_t base = COL_TEXT;
+	switch (line->category) {
+		case CAT_HEADER: base = COL_HEADER; break;
+		case CAT_KERNEL: base = COL_KERNEL; break;
+		default: base = COL_TEXT; break;
+	}
+	fill_colors(colors, 0, len, base);
+	if (len == 0) return;
+
+	// "[ 1234.567890]" / "[ 1234.567890]: " timestamp prefix -> dim
+	if (text[0] == '[') {
+		const char *close = strchr(text, ']');
+		if (close && (size_t)(close - text) <= 20) {
+			size_t end = (size_t)(close - text) + 1;
+			if (end < len && text[end] == ':') end++;
+			while (end < len && text[end] == ' ') end++;
+			fill_colors(colors, 0, end, COL_DIM);
+			pos = end;
+		}
 	}
 
-	size_t len = strlen(text);
+	const char *msg = text + pos;
+	size_t msgLen = len - pos;
+
+	if (line->category == CAT_HEADER) {
+		return;
+	}
+
+	if (line->category == CAT_KERNEL) {
+		if (line_looks_like_error(msg)) {
+			fill_colors(colors, pos, len, COL_ERROR);
+			return;
+		}
+		if (line_looks_like_warning(msg)) {
+			fill_colors(colors, pos, len, COL_WARN);
+			return;
+		}
+		// "Subsystem: message" -> highlight the subsystem
+		const char *colon = strstr(msg, ": ");
+		if (colon && (size_t)(colon - msg) > 0 && (size_t)(colon - msg) <= 48) {
+			fill_colors(colors, pos, pos + (size_t)(colon - msg) + 1, COL_KERNEL_TAG);
+		}
+		return;
+	}
+
+	// launchd / Dopamine lines: "tag: message"
+	uint8_t tagColor = (line->category == CAT_DOPAMINE) ? COL_TAG_DOPAMINE : COL_TAG_LAUNCHD;
+	const char *colon = strstr(msg, ": ");
+	size_t bodyStart = pos;
+	if (colon && (size_t)(colon - msg) <= 24) {
+		size_t tagEnd = pos + (size_t)(colon - msg) + 1;
+		fill_colors(colors, pos, tagEnd, tagColor);
+		bodyStart = tagEnd;
+		while (bodyStart < len && text[bodyStart] == ' ') bodyStart++;
+	}
+	const char *body = text + bodyStart;
+	size_t bodyLen = len - bodyStart;
+
+	if (line_looks_like_error(body)) {
+		fill_colors(colors, bodyStart, len, COL_ERROR);
+		return;
+	}
+	if (line->category == CAT_LAUNCHD) {
+		// "spawn <label>" / "exec <path>" -> highlight what got launched
+		if (bodyLen > 6 && !strncmp(body, "spawn ", 6)) {
+			fill_colors(colors, bodyStart + 6, len, COL_LABEL);
+			return;
+		}
+		if (bodyLen > 5 && !strncmp(body, "exec ", 5)) {
+			fill_colors(colors, bodyStart + 5, len, COL_LABEL);
+			return;
+		}
+		// Everything else launchd says during a userspace reboot is a milestone
+		fill_colors(colors, bodyStart, len, COL_MILESTONE);
+		return;
+	}
+	if (line_looks_like_warning(body)) {
+		fill_colors(colors, bodyStart, len, COL_WARN);
+	}
+	(void)msgLen;
+}
+
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+
+static int rows_for_line(const struct bootlog_line *line)
+{
+	size_t len = strlen(line->text);
+	if (len == 0) return 1;
+	return (int)((len + (size_t)g.cols - 1) / (size_t)g.cols);
+}
+
+static void render_blank_row(int row)
+{
 	for (int col = 0; col < g.cols; col++) {
-		char ch = (col < (int)len) ? text[col] : ' ';
-		draw_cell(col, row, ch, fg);
+		draw_cell(col, row, ' ', gPalette[COL_TEXT]);
 	}
 }
 
+// Renders one logical line starting at visual row `row`, returns the number of
+// rows used. Rows beyond the screen are skipped.
+static int render_line(const struct bootlog_line *line, int row)
+{
+	size_t len = strlen(line->text);
+	uint8_t colorsStack[BOOTLOG_MAX_LINE_LEN + 1];
+	uint8_t *colors = colorsStack;
+	if (len > BOOTLOG_MAX_LINE_LEN) len = BOOTLOG_MAX_LINE_LEN;
+	colorize_line(line, colors, len);
+
+	int used = 0;
+	size_t offset = 0;
+	do {
+		if (row + used >= g.rows) break;
+		for (int col = 0; col < g.cols; col++) {
+			size_t idx = offset + (size_t)col;
+			char ch = (idx < len) ? line->text[idx] : ' ';
+			uint32_t fg = (idx < len) ? gPalette[colors[idx]] : gPalette[COL_TEXT];
+			draw_cell(col, row + used, ch, fg);
+		}
+		used++;
+		offset += (size_t)g.cols;
+	} while (offset < len);
+	return used;
+}
+
+// Re-render the whole screen from the tail of the line history
 static void render_all(void)
 {
-	for (int row = 0; row < g.rows; row++) {
-		render_row(row);
+	// Walk backwards from the newest line and take as many as fit
+	int first = g.lineCount;
+	int total = 0;
+	for (int i = g.lineCount - 1; i >= 0; i--) {
+		int r = rows_for_line(&g.lines[i]);
+		if (total + r > g.rows) break;
+		total += r;
+		first = i;
 	}
+	if (first == g.lineCount && g.lineCount > 0) {
+		// The newest line alone is taller than the screen, show what fits
+		first = g.lineCount - 1;
+	}
+
+	int row = 0;
+	for (int i = first; i < g.lineCount && row < g.rows; i++) {
+		row += render_line(&g.lines[i], row);
+	}
+	for (; row < g.rows; row++) {
+		render_blank_row(row);
+	}
+	g.dirty = false;
 }
 
-static void flush(void)
+static void flush_now_locked(void)
 {
-	if (!g.ctx || !g.shadow) return;
+	if (g.ctxCount == 0 || !g.shadow) return;
+	if (g.dirty) render_all();
+	// Always draw into the surface that is *not* currently on screen, so the
+	// display never scans out a half copied frame
+	struct drawctx *target = g.ctx[g.nextCtx];
+	g.nextCtx = (g.nextCtx + 1) % g.ctxCount;
 	exec_with_asl_disabled(^{
-		drawctx_draw_raw(g.ctx, g.shadow, g.shadowSize);
+		drawctx_draw_raw(target, g.shadow, g.shadowSize);
+	});
+	g.lastFlush = monotonic_ns();
+}
+
+// Coalesces framebuffer swaps: flush right away if the last one is old
+// enough, otherwise schedule one so the latest lines still show up shortly.
+static void request_flush_locked(void)
+{
+	uint64_t now = monotonic_ns();
+	uint64_t elapsed = now - g.lastFlush;
+	if (g.lastFlush == 0 || elapsed >= BOOTLOG_FLUSH_INTERVAL_NS) {
+		flush_now_locked();
+		return;
+	}
+	if (g.flushPending) return;
+	g.flushPending = true;
+
+	uint32_t generation = g.generation;
+	uint64_t delay = BOOTLOG_FLUSH_INTERVAL_NS - elapsed;
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)delay), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+		pthread_mutex_lock(&gLock);
+		if (g.active && g.generation == generation) {
+			g.flushPending = false;
+			flush_now_locked();
+		}
+		pthread_mutex_unlock(&gLock);
 	});
 }
 
 // ---------------------------------------------------------------------------
-// Text buffer
+// Line history
 // ---------------------------------------------------------------------------
 
-// Append one visual row (no wrapping, no timestamp). Returns true if the
-// screen scrolled, in which case everything needs to be re-rendered.
-static bool push_row(char type, const char *text, size_t len)
+static void history_push(char category, const char *text)
 {
-	bool scrolled = false;
-	int index;
-
-	if (g.ringCount < g.rows) {
-		index = (g.ringHead + g.ringCount) % g.rows;
-		g.ringCount++;
+	if (g.lineCount >= BOOTLOG_MAX_HISTORY) {
+		// Drop the oldest quarter
+		int drop = BOOTLOG_MAX_HISTORY / 4;
+		for (int i = 0; i < drop; i++) free(g.lines[i].text);
+		memmove(g.lines, g.lines + drop, (size_t)(g.lineCount - drop) * sizeof(struct bootlog_line));
+		g.lineCount -= drop;
 	}
-	else {
-		g.ringHead = (g.ringHead + 1) % g.rows;
-		index = (g.ringHead + g.rows - 1) % g.rows;
-		scrolled = true;
+	if (g.lineCount >= g.lineCap) {
+		int newCap = g.lineCap ? g.lineCap * 2 : 256;
+		struct bootlog_line *newLines = realloc(g.lines, (size_t)newCap * sizeof(struct bootlog_line));
+		if (!newLines) return;
+		g.lines = newLines;
+		g.lineCap = newCap;
 	}
-
-	struct bootlog_row *row = &g.ring[index];
-	row->type = type;
-	if (len > BOOTLOG_MAX_COLS) len = BOOTLOG_MAX_COLS;
-	memcpy(row->text, text, len);
-	row->text[len] = '\0';
-
-	if (!scrolled) {
-		render_row(g.ringCount - 1);
-	}
-	return scrolled;
+	char *copy = strdup(text);
+	if (!copy) return;
+	g.lines[g.lineCount].category = category;
+	g.lines[g.lineCount].text = copy;
+	g.lineCount++;
+	g.dirty = true;
 }
 
-// Append a full line: sanitizes it, wraps it to the screen width and renders
-// the affected rows into the shadow buffer (does not flush).
-static void append_line_locked(char type, const char *line)
+static void history_free(void)
 {
-	char clean[BOOTLOG_MAX_COLS + 1];
+	for (int i = 0; i < g.lineCount; i++) free(g.lines[i].text);
+	free(g.lines);
+	g.lines = NULL;
+	g.lineCount = 0;
+	g.lineCap = 0;
+}
+
+// Sanitizes a line (printable ASCII only, tabs expanded, trailing whitespace
+// removed) and appends it. Does not flush.
+static void append_line_locked(char category, const char *line)
+{
+	char clean[BOOTLOG_MAX_LINE_LEN + 1];
 	size_t n = 0;
-	for (const char *p = line; *p && n < BOOTLOG_MAX_COLS; p++) {
+	for (const char *p = line; *p && n < BOOTLOG_MAX_LINE_LEN; p++) {
 		unsigned char c = (unsigned char)*p;
 		if (c == '\t') {
-			// Expand tabs to 4 spaces
-			for (int i = 0; i < 4 && n < BOOTLOG_MAX_COLS; i++) clean[n++] = ' ';
+			for (int i = 0; i < 4 && n < BOOTLOG_MAX_LINE_LEN; i++) clean[n++] = ' ';
 		}
 		else if (c == '\n' || c == '\r') {
 			break;
@@ -315,27 +587,9 @@ static void append_line_locked(char type, const char *line)
 			clean[n++] = (char)c;
 		}
 	}
-	// Trim trailing whitespace
 	while (n > 0 && clean[n - 1] == ' ') n--;
 	clean[n] = '\0';
-
-	bool scrolled = false;
-	if (n == 0) {
-		scrolled |= push_row(type, "", 0);
-	}
-	else {
-		size_t offset = 0;
-		while (offset < n) {
-			size_t chunk = n - offset;
-			if (chunk > (size_t)g.cols) chunk = (size_t)g.cols;
-			scrolled |= push_row(type, clean + offset, chunk);
-			offset += chunk;
-		}
-	}
-
-	if (scrolled) {
-		render_all();
-	}
+	history_push(category, clean);
 }
 
 static void persist_locked(void)
@@ -346,21 +600,20 @@ static void persist_locked(void)
 	FILE *f = fopen(tmpPath, "w");
 	if (!f) return;
 	if (g.kmsgLastLine[0]) {
-		fputc(BOOTLOG_PERSIST_KMSG_ANCHOR, f);
+		fputc(PERSIST_KMSG_ANCHOR, f);
 		fputs(g.kmsgLastLine, f);
 		fputc('\n', f);
 	}
-	for (int i = 0; i < g.ringCount; i++) {
-		struct bootlog_row *row = &g.ring[(g.ringHead + i) % g.rows];
-		fputc(row->type, f);
-		fputs(row->text, f);
+	for (int i = 0; i < g.lineCount; i++) {
+		fputc(g.lines[i].category, f);
+		fputs(g.lines[i].text, f);
 		fputc('\n', f);
 	}
 	fclose(f);
 	rename(tmpPath, BOOTLOG_PERSIST_PATH);
 }
 
-// Restore a log persisted by the previous launchd. Returns true if something
+// Restore the log persisted by the previous launchd. Returns true if something
 // was restored.
 static bool restore_locked(void)
 {
@@ -372,22 +625,19 @@ static bool restore_locked(void)
 	if (now - st.st_mtime >= 0 && now - st.st_mtime <= BOOTLOG_PERSIST_MAX_AGE) {
 		FILE *f = fopen(BOOTLOG_PERSIST_PATH, "r");
 		if (f) {
-			char line[BOOTLOG_MAX_COLS + 8];
+			char line[BOOTLOG_MAX_LINE_LEN + 8];
 			while (fgets(line, sizeof(line), f)) {
 				size_t len = strlen(line);
 				while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = '\0';
 				if (len == 0) continue;
 				char type = line[0];
-				if (type == BOOTLOG_PERSIST_KMSG_ANCHOR) {
+				if (type == PERSIST_KMSG_ANCHOR) {
 					// Continue the dmesg stream where the previous launchd left off
 					strlcpy(g.kmsgLastLine, line + 1, sizeof(g.kmsgLastLine));
 					continue;
 				}
-				if (type != BOOTLOG_ROW_TEXT && type != BOOTLOG_ROW_KERNEL && type != BOOTLOG_ROW_HEADER) continue;
-				// Rows were already wrapped for this screen, push them as-is
-				if (push_row(type, line + 1, len - 1)) {
-					render_all();
-				}
+				if (type != CAT_HEADER && type != CAT_KERNEL && type != CAT_LAUNCHD && type != CAT_DOPAMINE) continue;
+				history_push(type, line + 1);
 				restored = true;
 			}
 			fclose(f);
@@ -397,24 +647,42 @@ static bool restore_locked(void)
 	return restored;
 }
 
-static void vprintf_locked(char type, bool timestamp, const char *fmt, va_list ap)
+// Writes the complete log to the log file (best effort)
+static void write_logfile_locked(const char *reason)
 {
-	char msg[BOOTLOG_MAX_COLS + 1];
+	mkdir(BOOTLOG_LOGFILE_DIR, 0755);
+	FILE *f = fopen(BOOTLOG_LOGFILE_PATH, "w");
+	if (!f) return;
+	for (int i = 0; i < g.lineCount; i++) {
+		fputs(g.lines[i].text, f);
+		fputc('\n', f);
+	}
+	if (reason) {
+		fprintf(f, "\n-- bootlog stopped: %s --\n", reason);
+	}
+	fclose(f);
+	chmod(BOOTLOG_LOGFILE_PATH, 0644);
+}
+
+static void vprintf_locked(char category, bool timestamp, const char *fmt, va_list ap)
+{
+	char msg[BOOTLOG_MAX_LINE_LEN + 1];
 	size_t prefixLen = 0;
 	if (timestamp) {
-		int r = snprintf(msg, sizeof(msg), "[%9.3f] ", uptime_seconds());
+		uint64_t ns = kernel_clock_ns();
+		int r = snprintf(msg, sizeof(msg), "[%5llu.%06llu] ", (unsigned long long)(ns / NSEC_PER_SEC), (unsigned long long)((ns % NSEC_PER_SEC) / 1000));
 		if (r > 0) prefixLen = (size_t)r;
 	}
 	vsnprintf(msg + prefixLen, sizeof(msg) - prefixLen, fmt, ap);
-	append_line_locked(type, msg);
+	append_line_locked(category, msg);
 }
 
-static void printf_locked(char type, bool timestamp, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
-static void printf_locked(char type, bool timestamp, const char *fmt, ...)
+static void printf_locked(char category, bool timestamp, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
+static void printf_locked(char category, bool timestamp, const char *fmt, ...)
 {
 	va_list ap;
 	va_start(ap, fmt);
-	vprintf_locked(type, timestamp, fmt, ap);
+	vprintf_locked(category, timestamp, fmt, ap);
 	va_end(ap);
 }
 
@@ -447,7 +715,7 @@ static size_t read_kmsg(char *buf, size_t bufSize)
 	return 0;
 }
 
-// Prints kernel messages that appeared since the last poll. On the first poll
+// Appends kernel messages that appeared since the last poll. On the first poll
 // only the last BOOTLOG_KMSG_INITIAL_LINES lines are shown.
 static void poll_kmsg_locked(bool force)
 {
@@ -499,19 +767,17 @@ static void poll_kmsg_locked(bool force)
 		}
 	}
 
-	// Print line by line
 	char *p = start;
 	while (p < buf + n) {
 		char *nl = strchr(p, '\n');
 		size_t len = nl ? (size_t)(nl - p) : strlen(p);
 
-		// Strip trailing whitespace
 		while (len > 0 && isspace((unsigned char)p[len - 1])) len--;
 
 		if (len > 0) {
 			char saved = p[len];
 			p[len] = '\0';
-			append_line_locked(BOOTLOG_ROW_KERNEL, p);
+			append_line_locked(CAT_KERNEL, p);
 			strlcpy(g.kmsgLastLine, p, sizeof(g.kmsgLastLine));
 			p[len] = saved;
 		}
@@ -522,28 +788,55 @@ static void poll_kmsg_locked(bool force)
 }
 
 // ---------------------------------------------------------------------------
-// Framebuffer setup
+// Framebuffer setup / teardown
 // ---------------------------------------------------------------------------
+
+static void release_display_locked(void)
+{
+	for (int i = 0; i < g.ctxCount; i++) {
+		drawctx_free(g.ctx[i]);
+		g.ctx[i] = NULL;
+	}
+	g.ctxCount = 0;
+	g.nextCtx = 0;
+	if (g.shadow) {
+		free(g.shadow);
+		g.shadow = NULL;
+	}
+}
 
 static int setup_display_locked(void)
 {
-	g.ctx = drawctx_init();
-	if (!g.ctx) return -1;
+	struct drawctx *front = drawctx_init();
+	if (!front) return -1;
+	g.ctx[0] = front;
+	g.ctxCount = 1;
+	g.nextCtx = 0;
 
-	g.fbWidth = (int)g.ctx->size.width;
-	g.fbHeight = (int)g.ctx->size.height;
-	g.fbStride = g.ctx->bytesPerRow / 4;
-	g.shadowSize = (size_t)g.fbHeight * (size_t)g.ctx->bytesPerRow;
+	g.fbWidth = (int)front->size.width;
+	g.fbHeight = (int)front->size.height;
+	g.fbStride = front->bytesPerRow / 4;
+	g.shadowSize = (size_t)g.fbHeight * (size_t)front->bytesPerRow;
 	if (g.fbWidth <= 0 || g.fbHeight <= 0 || g.fbStride < g.fbWidth || g.shadowSize == 0) {
-		drawctx_free(g.ctx);
-		g.ctx = NULL;
+		release_display_locked();
 		return -1;
+	}
+
+	// Second surface for double buffering (optional, we cope without it)
+	struct drawctx *back = drawctx_init();
+	if (back) {
+		if ((int)back->size.width == g.fbWidth && (int)back->size.height == g.fbHeight && back->bytesPerRow == front->bytesPerRow) {
+			g.ctx[1] = back;
+			g.ctxCount = 2;
+		}
+		else {
+			drawctx_free(back);
+		}
 	}
 
 	g.shadow = malloc(g.shadowSize);
 	if (!g.shadow) {
-		drawctx_free(g.ctx);
-		g.ctx = NULL;
+		release_display_locked();
 		return -1;
 	}
 	memset(g.shadow, 0, g.shadowSize);
@@ -572,55 +865,43 @@ static int setup_display_locked(void)
 
 	g.cols = (g.logicalWidth - 2 * sideInset) / g.cellWidth;
 	g.rows = (g.logicalHeight - topInset - bottomInset) / g.cellHeight;
-	if (g.cols > BOOTLOG_MAX_COLS) g.cols = BOOTLOG_MAX_COLS;
+	if (g.cols > BOOTLOG_MAX_LINE_LEN) g.cols = BOOTLOG_MAX_LINE_LEN;
 	if (g.cols < 8 || g.rows < 2) {
-		free(g.shadow);
-		g.shadow = NULL;
-		drawctx_free(g.ctx);
-		g.ctx = NULL;
+		release_display_locked();
 		return -1;
 	}
 	g.originX = (g.logicalWidth - g.cols * g.cellWidth) / 2;
 	g.originY = topInset;
-
-	g.ring = calloc((size_t)g.rows, sizeof(struct bootlog_row));
-	if (!g.ring) {
-		free(g.shadow);
-		g.shadow = NULL;
-		drawctx_free(g.ctx);
-		g.ctx = NULL;
-		return -1;
-	}
-	g.ringHead = 0;
-	g.ringCount = 0;
 	return 0;
 }
 
 static void teardown_locked(void)
 {
-	if (g.ctx) {
-		struct drawctx *ctx = g.ctx;
-		exec_with_asl_disabled(^{
-			drawctx_free(ctx);
-		});
-		g.ctx = NULL;
-	}
-	if (g.shadow) {
-		free(g.shadow);
-		g.shadow = NULL;
-	}
-	if (g.ring) {
-		free(g.ring);
-		g.ring = NULL;
-	}
+	g.generation++;
+	exec_with_asl_disabled(^{
+		release_display_locked();
+	});
+	history_free();
 	if (g.kmsgBuf) {
 		free(g.kmsgBuf);
 		g.kmsgBuf = NULL;
 	}
 	g.kmsgLastLine[0] = '\0';
 	g.kmsgLastPoll = 0;
+	g.dirty = false;
+	g.flushPending = false;
+	g.lastFlush = 0;
 	g.active = false;
 	g.persist = false;
+}
+
+static void stop_locked(const char *reason)
+{
+	if (!g.active) return;
+	printf_locked(CAT_LAUNCHD, true, "launchd[1]: boot log stopped (%s)", reason ? reason : "no reason");
+	flush_now_locked();
+	write_logfile_locked(reason);
+	teardown_locked();
 }
 
 static void print_header_locked(void)
@@ -632,21 +913,33 @@ static void print_header_locked(void)
 
 	// The very first thing the real verbose boot prints is the kernel banner
 	if (sysctl_string("kern.version", version, sizeof(version)) == 0) {
-		printf_locked(BOOTLOG_ROW_HEADER, false, "%s", version);
+		printf_locked(CAT_HEADER, false, "%s", version);
 	}
 	if (sysctl_string("kern.bootargs", bootargs, sizeof(bootargs)) == 0) {
-		printf_locked(BOOTLOG_ROW_HEADER, false, "boot-args: %s", bootargs[0] ? bootargs : "(none)");
+		printf_locked(CAT_HEADER, false, "boot-args: %s", bootargs[0] ? bootargs : "(none)");
 	}
 	sysctl_string("hw.machine", machine, sizeof(machine));
 	sysctl_string("hw.model", model, sizeof(model));
-	printf_locked(BOOTLOG_ROW_HEADER, false, "hardware: %s (%s)", machine[0] ? machine : "?", model[0] ? model : "?");
+	printf_locked(CAT_HEADER, false, "hardware: %s (%s)", machine[0] ? machine : "?", model[0] ? model : "?");
 	const char *rootPath = jbinfo(rootPath);
-	printf_locked(BOOTLOG_ROW_HEADER, false, "Dopamine: launchdhook loaded, jbroot=%s", rootPath ? rootPath : "?");
-	printf_locked(BOOTLOG_ROW_HEADER, false, "%s", "");
+	printf_locked(CAT_HEADER, false, "Dopamine: launchdhook loaded, jbroot=%s", rootPath ? rootPath : "?");
+	printf_locked(CAT_HEADER, false, "%s", "");
 
 	// Followed by whatever the kernel logged so far
 	poll_kmsg_locked(true);
-	printf_locked(BOOTLOG_ROW_TEXT, false, "%s", "");
+	printf_locked(CAT_LAUNCHD, false, "%s", "");
+}
+
+static void arm_watchdog_locked(void)
+{
+	uint32_t generation = g.generation;
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)BOOTLOG_WATCHDOG_SECONDS * (int64_t)NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+		pthread_mutex_lock(&gLock);
+		if (g.active && g.generation == generation) {
+			stop_locked("watchdog timeout, backboardd never showed up?");
+		}
+		pthread_mutex_unlock(&gLock);
+	});
 }
 
 // ---------------------------------------------------------------------------
@@ -672,6 +965,7 @@ int bootlog_start(bool beforeUserspaceReboot)
 
 	g.active = true;
 	g.persist = beforeUserspaceReboot;
+	g.dirty = true;
 
 	bool restored = false;
 	if (!beforeUserspaceReboot) {
@@ -686,14 +980,16 @@ int bootlog_start(bool beforeUserspaceReboot)
 		print_header_locked();
 	}
 	if (beforeUserspaceReboot) {
-		printf_locked(BOOTLOG_ROW_TEXT, true, "launchd[1]: userspace reboot requested (kern.willuserspacereboot)");
-		printf_locked(BOOTLOG_ROW_TEXT, true, "launchd[1]: tearing down userspace...");
+		printf_locked(CAT_LAUNCHD, true, "launchd[1]: userspace reboot requested (kern.willuserspacereboot)");
+		printf_locked(CAT_LAUNCHD, true, "launchd[1]: tearing down userspace...");
 	}
 	else {
-		printf_locked(BOOTLOG_ROW_TEXT, true, "launchd[1]: userspace reboot: launchd re-executed (pid %d)", getpid());
+		printf_locked(CAT_LAUNCHD, true, "launchd[1]: userspace reboot: launchd re-executed (pid %d)", getpid());
+		// Only the launchd that survives the re-exec needs the safety net
+		arm_watchdog_locked();
 	}
 
-	flush();
+	flush_now_locked();
 	persist_locked();
 	pthread_mutex_unlock(&gLock);
 	return 0;
@@ -713,9 +1009,23 @@ void bootlog_printf(const char *fmt, ...)
 	if (g.active) {
 		va_list ap;
 		va_start(ap, fmt);
-		vprintf_locked(BOOTLOG_ROW_TEXT, true, fmt, ap);
+		vprintf_locked(CAT_LAUNCHD, true, fmt, ap);
 		va_end(ap);
-		flush();
+		request_flush_locked();
+		persist_locked();
+	}
+	pthread_mutex_unlock(&gLock);
+}
+
+void bootlog_dopamine_printf(const char *fmt, ...)
+{
+	pthread_mutex_lock(&gLock);
+	if (g.active) {
+		va_list ap;
+		va_start(ap, fmt);
+		vprintf_locked(CAT_DOPAMINE, true, fmt, ap);
+		va_end(ap);
+		request_flush_locked();
 		persist_locked();
 	}
 	pthread_mutex_unlock(&gLock);
@@ -730,29 +1040,42 @@ void bootlog_spawn_event(const char *path, char *const argv[])
 		// Kernel messages first, they happened before this spawn
 		poll_kmsg_locked(false);
 
+		char label[256] = "";
 		if (!strcmp(path, "/usr/libexec/xpcproxy") && argv && argv[0] && argv[1]) {
 			// launchd passes the label as argv[1], with a trailing newline
-			char label[256];
 			strlcpy(label, argv[1], sizeof(label));
 			size_t len = strlen(label);
-			while (len > 0 && (label[len - 1] == '\n' || label[len - 1] == '\r')) label[--len] = '\0';
-			printf_locked(BOOTLOG_ROW_TEXT, true, "launchd[1]: spawn %s", label);
-		}
-		else {
-			printf_locked(BOOTLOG_ROW_TEXT, true, "launchd[1]: exec %s", path);
+			while (len > 0 && isspace((unsigned char)label[len - 1])) label[--len] = '\0';
 		}
 
-		flush();
-		persist_locked();
+		if (label[0]) {
+			printf_locked(CAT_LAUNCHD, true, "launchd[1]: spawn %s", label);
+		}
+		else {
+			printf_locked(CAT_LAUNCHD, true, "launchd[1]: exec %s", path);
+		}
+
+		// Once backboardd starts, the display belongs to it. SpringBoard is
+		// checked as well in case backboardd was launched in a way we missed.
+		bool displayOwner =
+			!strcmp(label, "com.apple.backboardd") ||
+			!strcmp(label, "com.apple.SpringBoard") ||
+			!strcmp(path, "/usr/libexec/backboardd") ||
+			!strcmp(path, "/System/Library/CoreServices/SpringBoard.app/SpringBoard");
+		if (displayOwner) {
+			stop_locked(label[0] ? label : path);
+		}
+		else {
+			request_flush_locked();
+			persist_locked();
+		}
 	}
 	pthread_mutex_unlock(&gLock);
 }
 
-void bootlog_stop(void)
+void bootlog_stop(const char *reason)
 {
 	pthread_mutex_lock(&gLock);
-	if (g.active) {
-		teardown_locked();
-	}
+	stop_locked(reason ? reason : "stop requested");
 	pthread_mutex_unlock(&gLock);
 }

@@ -13,6 +13,16 @@
 // tail of the kernel message buffer (dmesg) and every process launchd spawns
 // until backboardd comes up and takes the display back.
 //
+// Lines are colored by what they are (timestamps, kernel messages, launchd
+// events, service labels, Dopamine messages, errors / warnings).
+//
+// Redraws are coalesced (at most one framebuffer swap every few dozen ms) and
+// the log stops itself when backboardd (or SpringBoard) is spawned, or after a
+// watchdog timeout, so it can never keep painting over the home screen.
+//
+// The full log of the last userspace reboot is written to
+// /var/mobile/Library/Logs/Dopamine/bootlog.txt when the log stops.
+//
 // All functions are thread safe and become no-ops when the log is not active,
 // so callers can invoke them unconditionally.
 //
@@ -35,16 +45,22 @@ int bootlog_start(bool beforeUserspaceReboot);
 // Whether the log is currently active (started and not yet stopped).
 bool bootlog_is_active(void);
 
-// Append one line (printf style). Long lines wrap like a terminal would.
-// Lines are prefixed with the current uptime.
+// Append one launchd line (printf style). Long lines wrap like a terminal
+// would. Lines are prefixed with the current uptime (same clock and format as
+// the kernel's message buffer).
 void bootlog_printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+
+// Same, but the line is attributed to Dopamine itself (different color).
+void bootlog_dopamine_printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
 // Log a process launch. `path` is the executable that was spawned, `argv` is
 // its argument vector (used to extract the launchd label from xpcproxy).
-// Also pulls any new kernel messages onto the screen first.
+// Also pulls any new kernel messages onto the screen first, and stops the log
+// by itself when the spawned process is backboardd or SpringBoard.
 void bootlog_spawn_event(const char *path, char *const argv[]);
 
-// Stop the log and release the framebuffer (call before backboardd starts).
-void bootlog_stop(void);
+// Stop the log, release the framebuffer and write the log file.
+// `reason` is recorded as the last line of the log file (may be NULL).
+void bootlog_stop(const char *reason);
 
 #endif // BOOTLOG_H

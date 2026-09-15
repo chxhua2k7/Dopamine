@@ -12,4 +12,4 @@ Application/Payload
 Tools/fastPathSign/.build_*
 Exploits/kfd/kfd.framework/kfd
 .sign
-dopamine-verbose-boot.patch
+dopamine-verbose-boot*.patch

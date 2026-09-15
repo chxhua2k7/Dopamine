@@ -94,9 +94,9 @@ void draw_boot_logo(const char *bootLogoPath, bool beforeUserspaceReboot)
 
 void free_boot_logo(void)
 {
+	// (The verbose boot log normally stops itself when it sees backboardd being spawned)
 	if (bootlog_is_active()) {
-		bootlog_printf("launchd[1]: handing the display over to backboardd");
-		bootlog_stop();
+		bootlog_stop("backboardd is starting");
 	}
 	if (gBootLogoDrawCtx) {
 		drawctx_free(gBootLogoDrawCtx);
@@ -165,11 +165,11 @@ __attribute__((constructor)) static void initializer(void)
 	if (err != 0) {
 		char msg[1000];
 		snprintf(msg, 1000, "Dopamine: Failed to recover primitives (error %d), cannot continue.", err);
-		bootlog_printf("%s", msg);
+		bootlog_dopamine_printf("%s", msg);
 		abort_with_reason(7, 1, msg, 0);
 		return;
 	}
-	bootlog_printf("Dopamine: kernel primitives recovered from boomerang");
+	bootlog_dopamine_printf("Dopamine: kernel primitives recovered from boomerang");
 
 	if (jbupdatePrevVersion && jbupdateNewVersion) {
 		jbupdate_finalize_stage2(jbupdatePrevVersion, jbupdateNewVersion);
@@ -192,7 +192,7 @@ __attribute__((constructor)) static void initializer(void)
 	initSpawnHooks();
 	initIPCHooks();
 	initJetsamHook();
-	bootlog_printf("Dopamine: launchd hooks installed, jbserver starting");
+	bootlog_dopamine_printf("Dopamine: launchd hooks installed, jbserver starting");
 
 	sysctlbyname_orig = sysctlbyname;
 	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, (void *)sysctlbyname, (void *)sysctlbyname_hook, NULL);
