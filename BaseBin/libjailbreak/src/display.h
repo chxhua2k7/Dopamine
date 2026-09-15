@@ -28,6 +28,8 @@ int save_image_bitmap_to_plist(CGImageRef imageRef, const char *outPath);
 CGImageRef load_image_from_bitmap_plist(const char *bitmapPlistPath);
 
 CGSize find_display_size(void);
+// Rotation (0 / 90 / 180 / 270 degrees) that an upright image has to be drawn with on the main screen
+CGFloat get_main_screen_rotation(void);
 struct drawctx *drawctx_init(void);
 void drawctx_free(struct drawctx *ctx);
 int drawctx_draw_raw_path(struct drawctx *ctx, const char *path);

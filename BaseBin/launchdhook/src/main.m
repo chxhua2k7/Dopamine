@@ -28,6 +28,7 @@
 #import "boomerang.h"
 #import "update.h"
 #import "jbserver/jbserver_local.h"
+#import "bootlog.h"
 #import "asl.h"
 
 bool gInEarlyBoot = true;
@@ -49,8 +50,30 @@ void exec_with_asl_disabled(void (^block)(void))
 struct drawctx *gBootLogoDrawCtx = NULL;
 bool gFreeBootLogoBeforeBackboardd = NO;
 
-void draw_boot_logo(const char *bootLogoPath)
+// Whether the user wants the verbose boot log instead of the static boot logo
+// beforeUserspaceReboot: true when called from the launchd that is about to re-exec itself,
+// false when called from the freshly re-executed launchd
+static bool verbose_boot_wanted(bool beforeUserspaceReboot)
 {
+	if (beforeUserspaceReboot) {
+		return jbsetting(verboseBootEnabled);
+	}
+	// Right after the re-exec, gSystemInfo has not been recovered from boomerang yet
+	// The previous launchd left a note in the environment for us (see spawn_hook.c)
+	return getenv("DOPAMINE_VERBOSE_BOOT") != NULL;
+}
+
+void draw_boot_logo(const char *bootLogoPath, bool beforeUserspaceReboot)
+{
+	if (verbose_boot_wanted(beforeUserspaceReboot)) {
+		// Same race as described below: get backboardd out of the way before we take the display
+		killall("/usr/libexec/backboardd", SIGTERM);
+		if (bootlog_start(beforeUserspaceReboot) == 0) {
+			return;
+		}
+		// Could not acquire the framebuffer for the log, fall back to the static logo
+	}
+
 	exec_with_asl_disabled(^{
 		if (!gBootLogoDrawCtx) {
 			gBootLogoDrawCtx = drawctx_init();
@@ -71,8 +94,14 @@ void draw_boot_logo(const char *bootLogoPath)
 
 void free_boot_logo(void)
 {
-	drawctx_free(gBootLogoDrawCtx);
-	gBootLogoDrawCtx = NULL;
+	if (bootlog_is_active()) {
+		bootlog_printf("launchd[1]: handing the display over to backboardd");
+		bootlog_stop();
+	}
+	if (gBootLogoDrawCtx) {
+		drawctx_free(gBootLogoDrawCtx);
+		gBootLogoDrawCtx = NULL;
+	}
 }
 
 int (*sysctlbyname_orig)(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) = NULL;
@@ -80,7 +109,7 @@ int sysctlbyname_hook(const char *name, void *oldp, size_t *oldlenp, void *newp,
 {
 	int r = sysctlbyname_orig(name, oldp, oldlenp, newp, newlen);
 	if (!strcmp(name, "kern.willuserspacereboot")) {
-		draw_boot_logo(JBROOT_PATH("/basebin/bootlogo.jp2"));
+		draw_boot_logo(JBROOT_PATH("/basebin/bootlogo.jp2"), true);
 	}
 	return r;
 }
@@ -122,7 +151,7 @@ __attribute__((constructor)) static void initializer(void)
 			remove("/var/mobile/Library/Preferences/com.apple.NanoRegistry.NRLaunchNotificationController.volatile.plist");
 		}
 
-		draw_boot_logo(JBROOT_PATH("/basebin/bootlogo.jp2"));
+		draw_boot_logo(JBROOT_PATH("/basebin/bootlogo.jp2"), false);
 		gFreeBootLogoBeforeBackboardd = YES;
 	}
 	else {
@@ -136,9 +165,11 @@ __attribute__((constructor)) static void initializer(void)
 	if (err != 0) {
 		char msg[1000];
 		snprintf(msg, 1000, "Dopamine: Failed to recover primitives (error %d), cannot continue.", err);
+		bootlog_printf("%s", msg);
 		abort_with_reason(7, 1, msg, 0);
 		return;
 	}
+	bootlog_printf("Dopamine: kernel primitives recovered from boomerang");
 
 	if (jbupdatePrevVersion && jbupdateNewVersion) {
 		jbupdate_finalize_stage2(jbupdatePrevVersion, jbupdateNewVersion);
@@ -161,6 +192,7 @@ __attribute__((constructor)) static void initializer(void)
 	initSpawnHooks();
 	initIPCHooks();
 	initJetsamHook();
+	bootlog_printf("Dopamine: launchd hooks installed, jbserver starting");
 
 	sysctlbyname_orig = sysctlbyname;
 	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, (void *)sysctlbyname, (void *)sysctlbyname_hook, NULL);

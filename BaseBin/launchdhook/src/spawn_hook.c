@@ -11,6 +11,8 @@
 #include <litehook.h>
 #include "jbserver/jbserver_local.h"
 #include "hookd_provider.h"
+#include "bootlog.h"
+#include <libjailbreak/info.h>
 extern char **environ;
 
 void abort_with_reason(uint32_t reason_namespace, uint64_t reason_code, const char *reason_string, uint64_t reason_flags);
@@ -100,6 +102,16 @@ int __posix_spawn_hook(pid_t *restrict pid, const char *restrict path,
 			// Fix Xcode debugging being broken after the userspace reboot
 			unmount("/Developer", MNT_FORCE);
 
+			// Tell the next launchd whether it should draw the verbose boot log instead of the boot logo
+			// (It needs to know this before it has recovered gSystemInfo from boomerang)
+			if (jbsetting(verboseBootEnabled)) {
+				setenv("DOPAMINE_VERBOSE_BOOT", "1", 1);
+			}
+			else {
+				unsetenv("DOPAMINE_VERBOSE_BOOT");
+			}
+			bootlog_printf("launchd[1]: re-executing %s", path);
+
 			// If there is a pending jailbreak update, apply it now
 			const char *stagedJailbreakUpdate = getenv("STAGED_JAILBREAK_UPDATE");
 			if (stagedJailbreakUpdate) {
@@ -156,6 +168,9 @@ int __posix_spawn_hook(pid_t *restrict pid, const char *restrict path,
 		// }
 	}
 #endif
+
+	// Verbose boot: show every process launchd spawns on screen (no-op when the boot log is not active)
+	bootlog_spawn_event(path, argv);
 
 	// We can't support injection into processes that get spawned before the launchd XPC server is up
 	// (Technically we could but there is little reason to, since it requires additional work)

@@ -576,11 +576,12 @@ void *boomerang_server(struct boomerang_info *info)
     BOOL tweaksEnabled = [[DOPreferenceManager sharedManager] boolPreferenceValueForKey:@"tweakInjectionEnabled" fallback:YES];
     BOOL idownloadEnabled = [[DOPreferenceManager sharedManager] boolPreferenceValueForKey:@"idownloadEnabled" fallback:NO];
     BOOL appJITEnabled = [[DOPreferenceManager sharedManager] boolPreferenceValueForKey:@"appJITEnabled" fallback:YES];
+    BOOL verboseBootEnabled = [[DOPreferenceManager sharedManager] boolPreferenceValueForKey:@"verboseBootEnabled" fallback:NO];
     NSNumber *jetsamMultiplierOption = [[DOPreferenceManager sharedManager] preferenceValueForKey:@"jetsamMultiplier"];
     
     struct utsname systemInfo;
     uname(&systemInfo);
-    NSString *startLog = [NSString stringWithFormat:@"Starting Jailbreak (Model: %s, %@, Configuration: {removeJailbreak=%d, tweakInjection=%d, idownload=%d, appJIT=%d})", systemInfo.machine, NSProcessInfo.processInfo.operatingSystemVersionString, removeJailbreakEnabled, tweaksEnabled, idownloadEnabled, appJITEnabled];
+    NSString *startLog = [NSString stringWithFormat:@"Starting Jailbreak (Model: %s, %@, Configuration: {removeJailbreak=%d, tweakInjection=%d, idownload=%d, appJIT=%d, verboseBoot=%d})", systemInfo.machine, NSProcessInfo.processInfo.operatingSystemVersionString, removeJailbreakEnabled, tweaksEnabled, idownloadEnabled, appJITEnabled, verboseBootEnabled];
     [[DOUIManager sharedInstance] sendLog:startLog debug:YES];
     
     *errOut = [self gatherSystemInformation];
@@ -594,6 +595,7 @@ void *boomerang_server(struct boomerang_info *info)
     
     gSystemInfo.jailbreakSettings.markAppsAsDebugged = appJITEnabled;
     gSystemInfo.jailbreakSettings.jetsamMultiplier = jetsamMultiplierOption ? (jetsamMultiplierOption.doubleValue / 2) : 0;
+    gSystemInfo.jailbreakSettings.verboseBootEnabled = verboseBootEnabled;
     
     [[DOUIManager sharedInstance] sendLog:DOLocalizedString(@"Building Phys R/W Primitive") debug:NO];
     *errOut = [self buildPhysRWPrimitive];

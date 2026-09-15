@@ -65,6 +65,8 @@
 "Enabled" = "啟用";
 "Custom_Boot_Logo" = "自訂開機 Logo";
 "Select_Image" = "選擇圖片";
+"Section_Verbose_Boot" = "Verbose Boot（詳細開機）";
+"Hint_Verbose_Boot" = "在重新啟動使用者空間時，以即時文字 log 取代開機 Logo：顯示核心版本、核心訊息緩衝區（dmesg）的最後幾行，以及 launchd 啟動的每個程序，直到 backboardd 接管螢幕為止。";
 
 // Settings Alerts
 "Alert_Tweak_Injection_Toggled_Title" = "需要重新啟動使用者空間";

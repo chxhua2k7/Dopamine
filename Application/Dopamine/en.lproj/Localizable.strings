@@ -65,6 +65,8 @@
 "Enabled" = "Enabled";
 "Custom_Boot_Logo" = "Custom Boot Logo";
 "Select_Image" = "Select Image";
+"Section_Verbose_Boot" = "Verbose Boot";
+"Hint_Verbose_Boot" = "Replaces the boot logo during the userspace reboot with a live text log: the kernel version, the tail of the kernel message buffer (dmesg) and every process launchd spawns, until backboardd takes over the screen.";
 
 // Settings Alerts
 "Alert_Tweak_Injection_Toggled_Title" = "Userspace Reboot Required";

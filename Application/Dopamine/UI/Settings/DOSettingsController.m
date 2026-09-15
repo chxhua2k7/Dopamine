@@ -390,6 +390,18 @@
             }
         }
 
+        PSSpecifier *verboseBootGroupSpecifier = [PSSpecifier emptyGroupSpecifier];
+        verboseBootGroupSpecifier.name = DOLocalizedString(@"Section_Verbose_Boot");
+        [verboseBootGroupSpecifier setProperty:DOLocalizedString(@"Hint_Verbose_Boot") forKey:@"footerText"];
+        [specifiers addObject:verboseBootGroupSpecifier];
+
+        PSSpecifier *verboseBootSpecifier = [PSSpecifier preferenceSpecifierNamed:DOLocalizedString(@"Enabled") target:self set:@selector(setVerboseBootEnabled:specifier:) get:@selector(readVerboseBootEnabled:) detail:nil cell:PSSwitchCell edit:nil];
+        [verboseBootSpecifier setProperty:@YES forKey:@"enabled"];
+        [verboseBootSpecifier setProperty:@"verboseBootEnabled" forKey:@"key"];
+        [verboseBootSpecifier setProperty:@NO forKey:@"default"];
+        verboseBootSpecifier.identifier = @"verboseBootEnabled";
+        [specifiers addObject:verboseBootSpecifier];
+
         _specifiers = specifiers;
     }
     return _specifiers;
@@ -500,6 +512,27 @@
     DOEnvironmentManager *envManager = [DOEnvironmentManager sharedManager];
     if (envManager.isJailbroken) {
         jbclient_platform_jbsettings_set_bool("markAppsAsDebugged", ((NSNumber *)value).boolValue);
+    }
+}
+
+- (id)readVerboseBootEnabled:(PSSpecifier *)specifier
+{
+    DOEnvironmentManager *envManager = [DOEnvironmentManager sharedManager];
+    if (envManager.isJailbroken) {
+        // While jailbroken, launchd holds the authoritative value
+        bool v = jbclient_jbsettings_get_bool("verboseBootEnabled");
+        return @(v);
+    }
+    return [self readPreferenceValue:specifier];
+}
+
+- (void)setVerboseBootEnabled:(id)value specifier:(PSSpecifier *)specifier
+{
+    [self setPreferenceValue:value specifier:specifier];
+    DOEnvironmentManager *envManager = [DOEnvironmentManager sharedManager];
+    if (envManager.isJailbroken) {
+        // Takes effect on the next userspace reboot, no need to redraw anything now
+        jbclient_platform_jbsettings_set_bool("verboseBootEnabled", ((NSNumber *)value).boolValue);
     }
 }
 
