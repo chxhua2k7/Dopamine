@@ -69,6 +69,13 @@ static proc_kmsgbuf_t resolve_proc_kmsgbuf(void)
 // so it can never keep painting over SpringBoard
 #define BOOTLOG_WATCHDOG_SECONDS 120
 
+// The log normally stops the moment launchd spawns backboardd, because from
+// then on the display belongs to backboardd and every further swap of ours
+// would flash over whatever it draws. backboardd needs a moment to actually
+// take the display though, so a small grace period keeps the log alive a bit
+// longer. 0 = stop immediately (safe default). Experimental, tune with care.
+#define BOOTLOG_BACKBOARDD_GRACE_MS 0
+
 // ---------------------------------------------------------------------------
 // Colors
 // ---------------------------------------------------------------------------
@@ -154,6 +161,7 @@ static struct {
 
 	bool dirty;           // shadow buffer needs re-rendering
 	bool flushPending;    // a deferred flush is scheduled
+	bool stopScheduled;   // backboardd was spawned, a delayed stop is on its way
 	uint64_t lastFlush;
 
 	char *kmsgBuf;
@@ -890,6 +898,7 @@ static void teardown_locked(void)
 	g.kmsgLastPoll = 0;
 	g.dirty = false;
 	g.flushPending = false;
+	g.stopScheduled = false;
 	g.lastFlush = 0;
 	g.active = false;
 	g.persist = false;
@@ -1055,17 +1064,25 @@ void bootlog_spawn_event(const char *path, char *const argv[])
 			printf_locked(CAT_LAUNCHD, true, "launchd[1]: exec %s", path);
 		}
 
-		// Once backboardd starts, the display belongs to it. SpringBoard is
-		// checked as well in case backboardd was launched in a way we missed.
-		bool displayOwner =
-			!strcmp(label, "com.apple.backboardd") ||
-			!strcmp(label, "com.apple.SpringBoard") ||
-			!strcmp(path, "/usr/libexec/backboardd") ||
-			!strcmp(path, "/System/Library/CoreServices/SpringBoard.app/SpringBoard");
-		if (displayOwner) {
+		// Once backboardd starts, the display belongs to it. (SpringBoard is
+		// deliberately not a stop condition: launchd spawns it before backboardd
+		// and it takes seconds until it has anything to show.)
+		bool backboardd = !strcmp(label, "com.apple.backboardd") || !strcmp(path, "/usr/libexec/backboardd");
+		if (backboardd && BOOTLOG_BACKBOARDD_GRACE_MS <= 0) {
 			stop_locked(label[0] ? label : path);
 		}
 		else {
+			if (backboardd && !g.stopScheduled) {
+				g.stopScheduled = true;
+				uint32_t generation = g.generation;
+				dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)BOOTLOG_BACKBOARDD_GRACE_MS * (int64_t)NSEC_PER_MSEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+					pthread_mutex_lock(&gLock);
+					if (g.active && g.generation == generation) {
+						stop_locked("backboardd grace period over");
+					}
+					pthread_mutex_unlock(&gLock);
+				});
+			}
 			request_flush_locked();
 			persist_locked();
 		}

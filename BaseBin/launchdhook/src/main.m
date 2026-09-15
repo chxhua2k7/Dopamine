@@ -94,10 +94,8 @@ void draw_boot_logo(const char *bootLogoPath, bool beforeUserspaceReboot)
 
 void free_boot_logo(void)
 {
-	// (The verbose boot log normally stops itself when it sees backboardd being spawned)
-	if (bootlog_is_active()) {
-		bootlog_stop("backboardd is starting");
-	}
+	// The verbose boot log is not touched here: it watches the spawns itself and
+	// stops when backboardd comes up (see bootlog_spawn_event), with an optional grace period
 	if (gBootLogoDrawCtx) {
 		drawctx_free(gBootLogoDrawCtx);
 		gBootLogoDrawCtx = NULL;
@@ -172,6 +170,7 @@ __attribute__((constructor)) static void initializer(void)
 	bootlog_dopamine_printf("Dopamine: kernel primitives recovered from boomerang");
 
 	if (jbupdatePrevVersion && jbupdateNewVersion) {
+		bootlog_dopamine_printf("Dopamine: finalizing jailbreak update %s -> %s", jbupdatePrevVersion, jbupdateNewVersion);
 		jbupdate_finalize_stage2(jbupdatePrevVersion, jbupdateNewVersion);
 		unsetenv("JBUPDATE_PREV_VERSION");
 		unsetenv("JBUPDATE_NEW_VERSION");
@@ -203,6 +202,7 @@ __attribute__((constructor)) static void initializer(void)
 
 		// Just like when we mount it inside the posix_spawn hook, the jbserver is not up at this point in time
 		// So we need to host our own here again, just so that jbctl can talk to it
+		bootlog_dopamine_printf("Dopamine: jailbreak is hidden, unmounting fakelib again");
 		mach_port_t serverPort = jbserver_local_start();
 		jbctl_earlyboot(serverPort, "internal", "fakelib", "unmount", NULL);
 		jbserver_local_stop();
@@ -224,4 +224,9 @@ __attribute__((constructor)) static void initializer(void)
 	// Set an identifier that uniquely identifies this userspace boot
 	// Part of rootless v2 spec
 	setenv("LAUNCHD_UUID", [NSUUID UUID].UUIDString.UTF8String, 1);
+
+	const char *tweakState = "enabled";
+	if (access(JBROOT_PATH("/basebin/.safe_mode"), F_OK) == 0) tweakState = "disabled (safe mode)";
+	else if (getenv("DISABLE_TWEAKS") && !strcmp(getenv("DISABLE_TWEAKS"), "1")) tweakState = "disabled (DISABLE_TWEAKS)";
+	bootlog_dopamine_printf("Dopamine: launchd initialization complete, tweak injection %s", tweakState);
 }

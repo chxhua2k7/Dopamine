@@ -48,6 +48,7 @@ void ensure_fakelib_mounted(void)
 		// Note down that the jailbreak was hidden
 		// So that after the userspace reboot, we can unmount fakelib again
 		setenv("DOPAMINE_IS_HIDDEN", "1", true);
+		bootlog_dopamine_printf("Dopamine: jailbreak was hidden, fakelib mounted again for the reboot");
 	}
 }
 
@@ -97,7 +98,9 @@ int __posix_spawn_hook(pid_t *restrict pid, const char *restrict path,
 #endif
 
 			// Before the userspace reboot, we want to stash the primitives into boomerang
+			bootlog_dopamine_printf("Dopamine: stashing kernel primitives into boomerang");
 			boomerang_stashPrimitives();
+			bootlog_dopamine_printf("Dopamine: primitives stashed, boomerang is holding them");
 
 			// Fix Xcode debugging being broken after the userspace reboot
 			unmount("/Developer", MNT_FORCE);
@@ -115,6 +118,7 @@ int __posix_spawn_hook(pid_t *restrict pid, const char *restrict path,
 			// If there is a pending jailbreak update, apply it now
 			const char *stagedJailbreakUpdate = getenv("STAGED_JAILBREAK_UPDATE");
 			if (stagedJailbreakUpdate) {
+				bootlog_dopamine_printf("Dopamine: applying staged jailbreak update from %s", stagedJailbreakUpdate);
 				int r = jbupdate_basebin(stagedJailbreakUpdate);
 				if (r != 0) {
 					char msg[1000];
