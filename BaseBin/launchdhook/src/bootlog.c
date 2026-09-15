@@ -13,7 +13,9 @@
 #include <pthread.h>
 #include <time.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <dlfcn.h>
+#include <sys/param.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <mach/mach_time.h>
@@ -69,12 +71,25 @@ static proc_kmsgbuf_t resolve_proc_kmsgbuf(void)
 // so it can never keep painting over SpringBoard
 #define BOOTLOG_WATCHDOG_SECONDS 120
 
-// The log normally stops the moment launchd spawns backboardd, because from
-// then on the display belongs to backboardd and every further swap of ours
-// would flash over whatever it draws. backboardd needs a moment to actually
-// take the display though, so a small grace period keeps the log alive a bit
-// longer. 0 = stop immediately (safe default). Experimental, tune with care.
-#define BOOTLOG_BACKBOARDD_GRACE_MS 0
+// When to stop drawing
+//
+// backboardd owns the display once it is up, but it does not put anything on
+// screen until SpringBoard has rendered its first frame (seconds later). Until
+// then our swaps are harmless, so the log keeps scrolling through the whole
+// SpringBoard launch. The moment SpringBoard is done launching has to be
+// observed from a normal process (launchd can't use libnotify), which is what
+// the com.opa334.Dopamine.bootlog launch daemon (`jbctl internal bootlog_watch`)
+// does: it waits for SpringBoard's "finished launching" notification and then
+// drops BOOTLOG_STOP_MARKER_PATH, which launchd polls for.
+//
+// If that daemon is not installed, the log falls back to stopping as soon as
+// backboardd is spawned. If it is installed but never reports back, the hard
+// cap below stops the log some seconds after backboardd was spawned.
+#define BOOTLOG_WATCHER_PLIST_RELPATH "/basebin/LaunchDaemons/com.opa334.Dopamine.bootlog.plist"
+#define BOOTLOG_ACTIVE_MARKER_PATH "/private/var/tmp/.dopamine_bootlog_active"
+#define BOOTLOG_STOP_MARKER_PATH "/private/var/tmp/.dopamine_bootlog_stop"
+#define BOOTLOG_STOP_MARKER_POLL_MS 25
+#define BOOTLOG_BACKBOARDD_HARD_CAP_MS 20000
 
 // ---------------------------------------------------------------------------
 // Colors
@@ -161,7 +176,8 @@ static struct {
 
 	bool dirty;           // shadow buffer needs re-rendering
 	bool flushPending;    // a deferred flush is scheduled
-	bool stopScheduled;   // backboardd was spawned, a delayed stop is on its way
+	bool watcherAvailable; // the bootlog launch daemon is installed and will tell us when SpringBoard is up
+	bool hardCapArmed;    // backboardd was spawned, the hard cap timer is running
 	uint64_t lastFlush;
 
 	char *kmsgBuf;
@@ -898,19 +914,93 @@ static void teardown_locked(void)
 	g.kmsgLastPoll = 0;
 	g.dirty = false;
 	g.flushPending = false;
-	g.stopScheduled = false;
+	g.watcherAvailable = false;
+	g.hardCapArmed = false;
 	g.lastFlush = 0;
 	g.active = false;
 	g.persist = false;
+	unlink(BOOTLOG_ACTIVE_MARKER_PATH);
+	unlink(BOOTLOG_STOP_MARKER_PATH);
 }
 
-static void stop_locked(const char *reason)
+// finalFlush: whether to put the "stopped" line on screen. Must be false when
+// SpringBoard may already be visible, one more swap would flash over it.
+static void stop_locked(const char *reason, bool finalFlush)
 {
 	if (!g.active) return;
 	printf_locked(CAT_LAUNCHD, true, "launchd[1]: boot log stopped (%s)", reason ? reason : "no reason");
-	flush_now_locked();
+	if (finalFlush) flush_now_locked();
 	write_logfile_locked(reason);
 	teardown_locked();
+}
+
+static void arm_backboardd_hard_cap_locked(void)
+{
+	if (g.hardCapArmed) return;
+	g.hardCapArmed = true;
+	uint32_t generation = g.generation;
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)BOOTLOG_BACKBOARDD_HARD_CAP_MS * (int64_t)NSEC_PER_MSEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+		pthread_mutex_lock(&gLock);
+		if (g.active && g.generation == generation) {
+			stop_locked("hard cap after backboardd spawn, the bootlog daemon never reported SpringBoard", false);
+		}
+		pthread_mutex_unlock(&gLock);
+	});
+}
+
+// Polls for the marker the bootlog daemon drops once SpringBoard finished launching
+static void poll_stop_marker(uint32_t generation)
+{
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)BOOTLOG_STOP_MARKER_POLL_MS * (int64_t)NSEC_PER_MSEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+		pthread_mutex_lock(&gLock);
+		if (!g.active || g.generation != generation) {
+			pthread_mutex_unlock(&gLock);
+			return;
+		}
+		if (access(BOOTLOG_STOP_MARKER_PATH, F_OK) == 0) {
+			char reason[256] = "bootlog daemon asked us to stop";
+			FILE *f = fopen(BOOTLOG_STOP_MARKER_PATH, "r");
+			if (f) {
+				char line[256];
+				if (fgets(line, sizeof(line), f)) {
+					size_t len = strlen(line);
+					while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = '\0';
+					if (len > 0) strlcpy(reason, line, sizeof(reason));
+				}
+				fclose(f);
+			}
+			stop_locked(reason, false);
+			pthread_mutex_unlock(&gLock);
+			return;
+		}
+		pthread_mutex_unlock(&gLock);
+		poll_stop_marker(generation);
+	});
+}
+
+// Called once in the re-executed launchd: figures out whether the bootlog
+// launch daemon is there and, if so, starts waiting for its signal
+static void setup_springboard_watch_locked(void)
+{
+	unlink(BOOTLOG_STOP_MARKER_PATH);
+	g.watcherAvailable = false;
+
+	const char *rootPath = jbinfo(rootPath);
+	if (!rootPath) return;
+	char plistPath[PATH_MAX];
+	snprintf(plistPath, sizeof(plistPath), "%s%s", rootPath, BOOTLOG_WATCHER_PLIST_RELPATH);
+	if (access(plistPath, F_OK) != 0) {
+		printf_locked(CAT_DOPAMINE, true, "Dopamine: bootlog daemon not installed, log will stop when backboardd starts");
+		return;
+	}
+
+	// Tell the daemon that there is a log to stop this boot
+	int fd = open(BOOTLOG_ACTIVE_MARKER_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (fd < 0) return;
+	close(fd);
+
+	g.watcherAvailable = true;
+	poll_stop_marker(g.generation);
 }
 
 static void print_header_locked(void)
@@ -945,7 +1035,7 @@ static void arm_watchdog_locked(void)
 	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)BOOTLOG_WATCHDOG_SECONDS * (int64_t)NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
 		pthread_mutex_lock(&gLock);
 		if (g.active && g.generation == generation) {
-			stop_locked("watchdog timeout, backboardd never showed up?");
+			stop_locked("watchdog timeout", false);
 		}
 		pthread_mutex_unlock(&gLock);
 	});
@@ -994,8 +1084,9 @@ int bootlog_start(bool beforeUserspaceReboot)
 	}
 	else {
 		printf_locked(CAT_LAUNCHD, true, "launchd[1]: userspace reboot: launchd re-executed (pid %d)", getpid());
-		// Only the launchd that survives the re-exec needs the safety net
+		// Only the launchd that survives the re-exec needs the safety nets
 		arm_watchdog_locked();
+		setup_springboard_watch_locked();
 	}
 
 	flush_now_locked();
@@ -1064,24 +1155,17 @@ void bootlog_spawn_event(const char *path, char *const argv[])
 			printf_locked(CAT_LAUNCHD, true, "launchd[1]: exec %s", path);
 		}
 
-		// Once backboardd starts, the display belongs to it. (SpringBoard is
-		// deliberately not a stop condition: launchd spawns it before backboardd
-		// and it takes seconds until it has anything to show.)
+		// backboardd owns the display from here on, but shows nothing until
+		// SpringBoard is done launching. With the bootlog daemon around we keep
+		// going until it reports that moment (hard cap as a safety net),
+		// without it this is where we have to stop.
 		bool backboardd = !strcmp(label, "com.apple.backboardd") || !strcmp(path, "/usr/libexec/backboardd");
-		if (backboardd && BOOTLOG_BACKBOARDD_GRACE_MS <= 0) {
-			stop_locked(label[0] ? label : path);
+		if (backboardd && !g.watcherAvailable) {
+			stop_locked(label[0] ? label : path, true);
 		}
 		else {
-			if (backboardd && !g.stopScheduled) {
-				g.stopScheduled = true;
-				uint32_t generation = g.generation;
-				dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)BOOTLOG_BACKBOARDD_GRACE_MS * (int64_t)NSEC_PER_MSEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-					pthread_mutex_lock(&gLock);
-					if (g.active && g.generation == generation) {
-						stop_locked("backboardd grace period over");
-					}
-					pthread_mutex_unlock(&gLock);
-				});
+			if (backboardd) {
+				arm_backboardd_hard_cap_locked();
 			}
 			request_flush_locked();
 			persist_locked();
@@ -1093,6 +1177,6 @@ void bootlog_spawn_event(const char *path, char *const argv[])
 void bootlog_stop(const char *reason)
 {
 	pthread_mutex_lock(&gLock);
-	stop_locked(reason ? reason : "stop requested");
+	stop_locked(reason ? reason : "stop requested", false);
 	pthread_mutex_unlock(&gLock);
 }

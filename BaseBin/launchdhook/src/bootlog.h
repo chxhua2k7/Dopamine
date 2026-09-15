@@ -16,9 +16,14 @@
 // Lines are colored by what they are (timestamps, kernel messages, launchd
 // events, service labels, Dopamine messages, errors / warnings).
 //
-// Redraws are coalesced (at most one framebuffer swap every few dozen ms) and
-// the log stops itself when backboardd (or SpringBoard) is spawned, or after a
-// watchdog timeout, so it can never keep painting over the home screen.
+// Redraws are coalesced (at most one framebuffer swap every few dozen ms).
+// The log keeps scrolling through the whole SpringBoard launch and stops right
+// before SpringBoard shows its first frame: the com.opa334.Dopamine.bootlog
+// launch daemon (`jbctl internal bootlog_watch`) waits for SpringBoard's
+// "finished launching" notification and drops a marker file that launchd polls
+// for. Without that daemon the log stops as soon as backboardd is spawned, and
+// a hard cap plus a watchdog make sure it can never keep painting over the
+// home screen.
 //
 // The full log of the last userspace reboot is written to
 // /var/mobile/Library/Logs/Dopamine/bootlog.txt when the log stops.
@@ -55,8 +60,8 @@ void bootlog_dopamine_printf(const char *fmt, ...) __attribute__((format(printf,
 
 // Log a process launch. `path` is the executable that was spawned, `argv` is
 // its argument vector (used to extract the launchd label from xpcproxy).
-// Also pulls any new kernel messages onto the screen first, and stops the log
-// by itself when the spawned process is backboardd or SpringBoard.
+// Also pulls any new kernel messages onto the screen first. Spawning backboardd
+// either stops the log (no bootlog daemon) or arms the hard cap.
 void bootlog_spawn_event(const char *path, char *const argv[]);
 
 // Stop the log, release the framebuffer and write the log file.

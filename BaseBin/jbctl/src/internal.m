@@ -2,7 +2,73 @@
 #import <Foundation/Foundation.h>
 #import <libjailbreak/libjailbreak.h>
 #import <sys/mount.h>
+#import <notify.h>
 #import <libjailbreak/stock_fixes.h>
+
+// Companion of the verbose boot log in launchdhook (bootlog.c)
+#define BOOTLOG_ACTIVE_MARKER_PATH "/private/var/tmp/.dopamine_bootlog_active"
+#define BOOTLOG_STOP_MARKER_PATH "/private/var/tmp/.dopamine_bootlog_stop"
+#define BOOTLOG_WATCH_TIMEOUT_SECONDS 60
+
+// launchd cannot use libnotify itself, so this (spawned by the
+// com.opa334.Dopamine.bootlog launch daemon on every userspace boot) waits for
+// SpringBoard to report that it finished launching and then drops a marker
+// file that tells launchdhook to stop drawing the boot log, right before
+// SpringBoard puts its first frame on screen. Returns immediately when no
+// boot log is active.
+static int bootlog_watch(void)
+{
+	if (access(BOOTLOG_ACTIVE_MARKER_PATH, F_OK) != 0) return 0;
+
+	// Serial queue so the callbacks below can't race each other
+	dispatch_queue_t queue = dispatch_queue_create("com.opa334.Dopamine.bootlog.watch", DISPATCH_QUEUE_SERIAL);
+	dispatch_semaphore_t done = dispatch_semaphore_create(0);
+	NSMutableString *seen = [NSMutableString new];
+	__block NSString *stopReason = nil;
+	NSDate *start = [NSDate date];
+
+	// The first two are posted by SpringBoard when it is done launching, the
+	// others are only recorded (with their timing) to learn how they relate
+	struct { const char *name; bool stops; } notifications[] = {
+		{ "SBSpringBoardDidLaunchNotification", true },
+		{ "com.apple.springboard.finishedstartup", true },
+		{ "com.apple.springboard.lockstate", false },
+		{ "com.apple.springboard.lockcomplete", false },
+	};
+	size_t count = sizeof(notifications) / sizeof(notifications[0]);
+	int tokens[sizeof(notifications) / sizeof(notifications[0])];
+	for (size_t i = 0; i < count; i++) {
+		const char *name = notifications[i].name;
+		bool stops = notifications[i].stops;
+		tokens[i] = 0;
+		int token = 0;
+		uint32_t r = notify_register_dispatch(name, &token, queue, ^(int t) {
+			[seen appendFormat:@"%s@%.3fs ", name, [[NSDate date] timeIntervalSinceDate:start]];
+			if (stops && !stopReason) {
+				stopReason = [NSString stringWithFormat:@"SpringBoard finished launching (%s)", name];
+				dispatch_semaphore_signal(done);
+			}
+		});
+		if (r == NOTIFY_STATUS_OK) tokens[i] = token;
+	}
+
+	long waitResult = dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, (int64_t)BOOTLOG_WATCH_TIMEOUT_SECONDS * (int64_t)NSEC_PER_SEC));
+	for (size_t i = 0; i < count; i++) {
+		if (tokens[i]) notify_cancel(tokens[i]);
+	}
+
+	__block NSString *reason = nil;
+	dispatch_sync(queue, ^{
+		reason = (waitResult == 0 && stopReason) ? stopReason : @"timed out waiting for SpringBoard";
+		if (seen.length) reason = [NSString stringWithFormat:@"%@ [seen: %@]", reason, seen];
+	});
+
+	// Write atomically, launchd polls for this file
+	NSString *tmpPath = @BOOTLOG_STOP_MARKER_PATH ".tmp";
+	[[reason stringByAppendingString:@"\n"] writeToFile:tmpPath atomically:NO encoding:NSUTF8StringEncoding error:nil];
+	rename(tmpPath.fileSystemRepresentation, BOOTLOG_STOP_MARKER_PATH);
+	return 0;
+}
 
 SInt32 CFUserNotificationDisplayAlert(CFTimeInterval timeout, CFOptionFlags flags, CFURLRef iconURL, CFURLRef soundURL, CFURLRef localizationURL, CFStringRef alertHeader, CFStringRef alertMessage, CFStringRef defaultButtonTitle, CFStringRef alternateButtonTitle, CFStringRef otherButtonTitle, CFOptionFlags *responseFlags) API_AVAILABLE(ios(3.0));
 
@@ -178,6 +244,9 @@ int jbctl_handle_internal(const char *command, int argc, char* argv[])
 			free(panicMessage);
 		}
 		exec_cmd(JBROOT_PATH("/usr/bin/uicache"), "-a", NULL);
+	}
+	else if (!strcmp(command, "bootlog_watch")) {
+		return bootlog_watch();
 	}
 	else if (!strcmp(command, "install_pkg")) {
 		if (argc > 1) {
