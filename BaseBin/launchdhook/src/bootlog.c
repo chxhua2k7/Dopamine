@@ -91,6 +91,14 @@ static proc_kmsgbuf_t resolve_proc_kmsgbuf(void)
 #define BOOTLOG_STOP_MARKER_POLL_MS 25
 #define BOOTLOG_BACKBOARDD_HARD_CAP_MS 20000
 
+// Second line of defense, independent of any daemon: the swap ids that
+// IOMobileFramebufferSwapBegin hands out are a per-display counter. As long as
+// only we swap, every swap of ours gets the previous id + 1. The moment
+// backboardd presents SpringBoard's first frame, our next swap sees a gap, and
+// we stop on the spot (that one frame of ours is the only thing that can ever
+// end up over SpringBoard). Whether the ids really are per-display is verified
+// at startup by looking at the ids of our own two surfaces.
+
 // ---------------------------------------------------------------------------
 // Colors
 // ---------------------------------------------------------------------------
@@ -179,6 +187,11 @@ static struct {
 	bool watcherAvailable; // the bootlog launch daemon is installed and will tell us when SpringBoard is up
 	bool hardCapArmed;    // backboardd was spawned, the hard cap timer is running
 	uint64_t lastFlush;
+
+	bool swapIdsGlobal;   // swap ids are a per-display counter, foreign swaps can be detected
+	int firstSwapToken;
+	int lastSwapToken;
+	int foreignSwaps;     // gaps seen in the swap id sequence
 
 	char *kmsgBuf;
 	char kmsgLastLine[256];
@@ -514,6 +527,8 @@ static void render_all(void)
 	g.dirty = false;
 }
 
+static void stop_locked(const char *reason, bool finalFlush);
+
 static void flush_now_locked(void)
 {
 	if (g.ctxCount == 0 || !g.shadow) return;
@@ -526,6 +541,20 @@ static void flush_now_locked(void)
 		drawctx_draw_raw(target, g.shadow, g.shadowSize);
 	});
 	g.lastFlush = monotonic_ns();
+
+	// Did somebody else swap since our previous swap? Then the display is no
+	// longer ours (only checked after the re-exec, the old launchd's display is
+	// being torn down around us and that is expected to be noisy).
+	int token = target->lastSwapToken;
+	int delta = token - g.lastSwapToken;
+	bool tokensValid = (token > 0 && g.lastSwapToken > 0);
+	g.lastSwapToken = token;
+	if (g.swapIdsGlobal && !g.persist && tokensValid && delta >= 2 && delta <= 10000) {
+		g.foreignSwaps++;
+		char reason[160];
+		snprintf(reason, sizeof(reason), "display taken over by someone else (swap id jumped %d -> %d)", token - delta, token);
+		stop_locked(reason, false);
+	}
 }
 
 // Coalesces framebuffer swaps: flush right away if the last one is old
@@ -684,6 +713,10 @@ static void write_logfile_locked(const char *reason)
 	if (reason) {
 		fprintf(f, "\n-- bootlog stopped: %s --\n", reason);
 	}
+	fprintf(f, "-- swap ids: %s (first %d, last %d, gaps seen %d); bootlog daemon %s --\n",
+		g.swapIdsGlobal ? "per-display counter" : "not usable for takeover detection",
+		g.firstSwapToken, g.lastSwapToken, g.foreignSwaps,
+		g.watcherAvailable ? "installed" : "not installed");
 	fclose(f);
 	chmod(BOOTLOG_LOGFILE_PATH, 0644);
 }
@@ -856,6 +889,20 @@ static int setup_display_locked(void)
 		else {
 			drawctx_free(back);
 		}
+	}
+
+	// Both inits swapped once. If the ids are a per-display counter, the second
+	// one is right after the first (allow a little slack for a stray swap of a
+	// dying process in between). Independent per-client counters would hand
+	// out the same id twice.
+	g.firstSwapToken = front->lastSwapToken;
+	g.lastSwapToken = front->lastSwapToken;
+	g.swapIdsGlobal = false;
+	g.foreignSwaps = 0;
+	if (g.ctxCount == 2 && front->lastSwapToken > 0 && g.ctx[1]->lastSwapToken > 0) {
+		int gap = g.ctx[1]->lastSwapToken - front->lastSwapToken;
+		g.swapIdsGlobal = (gap >= 1 && gap <= 3);
+		g.lastSwapToken = g.ctx[1]->lastSwapToken;
 	}
 
 	g.shadow = malloc(g.shadowSize);

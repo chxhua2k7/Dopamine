@@ -18,6 +18,7 @@ struct drawctx {
 	int bytesPerRow;
 	IOMobileFramebufferRef framebuffer;
 	IOSurfaceRef surface;
+	int lastSwapToken; // swap id handed out by IOMobileFramebufferSwapBegin for the most recent swap
 };
 
 int draw_image_to_buf(CGImageRef cgImage, IOMobileFramebufferDisplaySize size, CGFloat rotation, void **bufOut, size_t *bufSizeOut);

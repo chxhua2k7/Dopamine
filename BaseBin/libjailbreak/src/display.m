@@ -17,10 +17,12 @@ int drawctx_update(struct drawctx *d)
 {
 	if (!d || !d->framebuffer) return -1;
 
-	int token;
+	int token = 0;
 	IOMobileFramebufferSwapBegin(d->framebuffer, &token);
 	IOMobileFramebufferSwapSetLayer(d->framebuffer, 0, d->surface, (CGRect){ { 0, 0 }, { d->size.width, d->size.height } }, (CGRect){ { 0, 0 }, { d->size.width, d->size.height } }, 0);
-	return IOMobileFramebufferSwapEnd(d->framebuffer);
+	int r = IOMobileFramebufferSwapEnd(d->framebuffer);
+	d->lastSwapToken = token;
+	return r;
 }
 
 IOMobileFramebufferReturn find_target_display(IOMobileFramebufferRef *pointer)
