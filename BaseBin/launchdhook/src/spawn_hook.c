@@ -103,7 +103,12 @@ int __posix_spawn_hook(pid_t *restrict pid, const char *restrict path,
 			bootlog_dopamine_printf("Dopamine: primitives stashed, boomerang is holding them");
 
 			// Fix Xcode debugging being broken after the userspace reboot
-			unmount("/Developer", MNT_FORCE);
+			if (__builtin_available(iOS 17.0, *)) {
+				unmount("/System/Developer", MNT_FORCE);
+			}
+			else {
+				unmount("/Developer", MNT_FORCE);
+			}
 
 			// Tell the next launchd whether it should draw the verbose boot log instead of the boot logo
 			// (It needs to know this before it has recovered gSystemInfo from boomerang)
