@@ -1,0 +1,148 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>entry</key>
+	<dict>
+		<key>bundle</key>
+		<string>BootLogStopPrefs</string>
+		<key>cell</key>
+		<string>PSLinkCell</string>
+		<key>icon</key>
+		<string>BootLogStop.png</string>
+		<key>isController</key>
+		<true/>
+		<key>label</key>
+		<string>BootLogStop</string>
+		<key>pl_alt_plist_name</key>
+		<string>BootLogStop</string>
+	</dict>
+	<key>title</key>
+	<string>BootLogStop</string>
+	<key>items</key>
+	<array>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>footerText</key>
+			<string>Stops Dopamine's verbose boot log when the lock screen appears. Changes take effect on the next userspace reboot.</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSLinkListCell</string>
+			<key>default</key>
+			<string>firstFrame</string>
+			<key>defaults</key>
+			<string>com.c3x14n.bootlogstop</string>
+			<key>detail</key>
+			<string>PSListItemsController</string>
+			<key>iconColor</key>
+			<string>#FF3B30</string>
+			<key>iconSymbol</key>
+			<string>stop.fill</string>
+			<key>key</key>
+			<string>stopAt</string>
+			<key>label</key>
+			<string>Stop at</string>
+			<key>validTitles</key>
+			<array>
+				<string>First frame (recommended)</string>
+				<string>Lock screen will appear</string>
+				<string>Lock screen appeared</string>
+			</array>
+			<key>validValues</key>
+			<array>
+				<string>firstFrame</string>
+				<string>willAppear</string>
+				<string>didAppear</string>
+			</array>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>footerText</key>
+			<string>Writes each SpringBoard event to bootlog_springboard.txt, on the same clock as bootlog.txt.</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>default</key>
+			<true/>
+			<key>defaults</key>
+			<string>com.c3x14n.bootlogstop</string>
+			<key>iconColor</key>
+			<string>#0A84FF</string>
+			<key>iconSymbol</key>
+			<string>list.bullet.rectangle</string>
+			<key>key</key>
+			<string>trace</string>
+			<key>label</key>
+			<string>Record event timeline</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>footerText</key>
+			<string>From /var/mobile/Library/Logs/Dopamine/bootlog.txt.</string>
+			<key>label</key>
+			<string>Last boot</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSTitleValueCell</string>
+			<key>get</key>
+			<string>blsLastBootDate:</string>
+			<key>iconColor</key>
+			<string>#FF9500</string>
+			<key>iconSymbol</key>
+			<string>calendar</string>
+			<key>label</key>
+			<string>Date</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSTitleValueCell</string>
+			<key>get</key>
+			<string>blsLastBootDuration:</string>
+			<key>iconColor</key>
+			<string>#34C759</string>
+			<key>iconSymbol</key>
+			<string>timer</string>
+			<key>label</key>
+			<string>Log ran for</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSTitleValueCell</string>
+			<key>get</key>
+			<string>blsLastBootStoppedBy:</string>
+			<key>iconColor</key>
+			<string>#AF52DE</string>
+			<key>iconSymbol</key>
+			<string>flag.checkered</string>
+			<key>label</key>
+			<string>Stopped by</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>footerText</key>
+			<string>© 2026 chxhua2k7. Licensed under MIT.</string>
+			<key>label</key>
+			<string>About</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSTitleValueCell</string>
+			<key>get</key>
+			<string>blsVersion:</string>
+			<key>iconColor</key>
+			<string>#8F8F94</string>
+			<key>iconSymbol</key>
+			<string>info.circle</string>
+			<key>label</key>
+			<string>Version</string>
+		</dict>
+	</array>
+</dict>
+</plist>

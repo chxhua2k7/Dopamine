@@ -1,0 +1,29 @@
+/* BootLogStop settings page. Keys are the English strings in BootLogStop.plist and BLSRootListController.m. */
+
+"BootLogStop" = "BootLogStop";
+"Stop at" = "停止時機";
+"First frame (recommended)" = "第一幀畫面（建議）";
+"Lock screen will appear" = "鎖定畫面即將出現";
+"Lock screen appeared" = "鎖定畫面已出現";
+"Record event timeline" = "記錄事件時間線";
+"Last boot" = "上次開機";
+"Date" = "時間";
+"Log ran for" = "Log 持續";
+"Stopped by" = "停止原因";
+"About" = "關於";
+"Version" = "版本";
+"Stops Dopamine's verbose boot log when the lock screen appears. Changes take effect on the next userspace reboot." = "鎖定畫面一出現，就停止 Dopamine 的 verbose boot log。變更在下次 userspace reboot 生效。";
+"Writes each SpringBoard event to bootlog_springboard.txt, on the same clock as bootlog.txt." = "把 SpringBoard 的每個事件寫進 bootlog_springboard.txt，時鐘和 bootlog.txt 相同。";
+"From /var/mobile/Library/Logs/Dopamine/bootlog.txt." = "來源：/var/mobile/Library/Logs/Dopamine/bootlog.txt。";
+"© 2026 chxhua2k7. Licensed under MIT." = "© 2026 chxhua2k7。以 MIT 授權。";
+"Apply" = "套用";
+"Restart SpringBoard to apply?" = "要重啟 SpringBoard 套用嗎？";
+"Cancel" = "取消";
+"Respring" = "重啟";
+"No record yet" = "尚無紀錄";
+"%.1f s" = "%.1f 秒";
+"First frame" = "第一幀畫面";
+"Hard cap (20 s)" = "硬上限（20 秒）";
+"Watchdog (120 s)" = "Watchdog（120 秒）";
+"backboardd started" = "backboardd 啟動";
+"Unknown" = "不明";

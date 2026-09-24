@@ -1,0 +1,29 @@
+/* BootLogStop settings page. Keys are the English strings in BootLogStop.plist and BLSRootListController.m. */
+
+"BootLogStop" = "BootLogStop";
+"Stop at" = "停止タイミング";
+"First frame (recommended)" = "最初のフレーム（推奨）";
+"Lock screen will appear" = "ロック画面が表示される直前";
+"Lock screen appeared" = "ロック画面の表示後";
+"Record event timeline" = "イベントのタイムラインを記録";
+"Last boot" = "前回の起動";
+"Date" = "日時";
+"Log ran for" = "ログの表示時間";
+"Stopped by" = "停止理由";
+"About" = "情報";
+"Version" = "バージョン";
+"Stops Dopamine's verbose boot log when the lock screen appears. Changes take effect on the next userspace reboot." = "ロック画面が表示された時点で Dopamine の verbose boot log を止めます。変更は次回の userspace reboot で反映されます。";
+"Writes each SpringBoard event to bootlog_springboard.txt, on the same clock as bootlog.txt." = "SpringBoard の各イベントを bootlog_springboard.txt に記録します。時刻は bootlog.txt と同じ時計です。";
+"From /var/mobile/Library/Logs/Dopamine/bootlog.txt." = "出典：/var/mobile/Library/Logs/Dopamine/bootlog.txt。";
+"© 2026 chxhua2k7. Licensed under MIT." = "© 2026 chxhua2k7。MIT ライセンス。";
+"Apply" = "適用";
+"Restart SpringBoard to apply?" = "SpringBoard を再起動して適用しますか？";
+"Cancel" = "キャンセル";
+"Respring" = "再起動";
+"No record yet" = "記録なし";
+"%.1f s" = "%.1f 秒";
+"First frame" = "最初のフレーム";
+"Hard cap (20 s)" = "上限時間（20 秒）";
+"Watchdog (120 s)" = "Watchdog（120 秒）";
+"backboardd started" = "backboardd の起動";
+"Unknown" = "不明";

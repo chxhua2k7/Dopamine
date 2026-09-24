@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key><string>en</string>
+	<!-- __VERSION__ 由 Makefile 在 stage 時換成 PACKAGE_VERSION,不要手改。 -->
+	<key>CFBundleExecutable</key><string>BootLogStopPrefs</string>
+	<key>CFBundleIdentifier</key><string>com.c3x14n.bootlogstop.prefs</string>
+	<key>CFBundleName</key><string>BootLogStop</string>
+	<key>CFBundlePackageType</key><string>BNDL</string>
+	<key>NSPrincipalClass</key><string>BLSRootListController</string>
+	<key>CFBundleShortVersionString</key><string>__VERSION__</string>
+	<key>CFBundleVersion</key><string>__VERSION__</string>
+</dict>
+</plist>

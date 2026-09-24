@@ -1,9 +1,12 @@
 Package: com.c3x14n.bootlogstop
 Name: BootLogStop
-Version: 1.0.1
+Version: 1.1.0
 Architecture: iphoneos-arm64
-Description: Tells Dopamine's verbose boot log to stop the moment the lock screen appears.
-Depends: mobilesubstrate
+Description: Stops Dopamine's verbose boot log the moment the lock screen appears. Needs the verbose-boot build of Dopamine.
+Homepage: https://github.com/chxhua2k7/Dopamine
+Depends: mobilesubstrate, preferenceloader (>= 2.2.6)
 Maintainer: chxhua2k7 <xianghuachen2007@icloud.com>
 Author: chxhua2k7 <xianghuachen2007@icloud.com>
 Section: Tweaks
+License: MIT
+Icon: file:///var/jb/Library/PreferenceBundles/BootLogStopPrefs.bundle/BootLogStop@3x.png
