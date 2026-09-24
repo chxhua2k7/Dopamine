@@ -98,6 +98,12 @@ static proc_kmsgbuf_t resolve_proc_kmsgbuf(void)
 // we stop on the spot (that one frame of ours is the only thing that can ever
 // end up over SpringBoard). Whether the ids really are per-display is verified
 // at startup by looking at the ids of our own two surfaces.
+//
+// BOOTLOG_SWAP_TAKEOVER_ACTION: 0 = observe only (a "takeover suspected" line
+// is added to the log every time a gap is seen, nothing else happens), 1 = stop
+// the log at the first gap. Observe mode is for finding out how the ids behave
+// on real hardware before trusting them.
+#define BOOTLOG_SWAP_TAKEOVER_ACTION 0
 
 // ---------------------------------------------------------------------------
 // Colors
@@ -528,6 +534,7 @@ static void render_all(void)
 }
 
 static void stop_locked(const char *reason, bool finalFlush);
+static void printf_locked(char category, bool timestamp, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
 
 static void flush_now_locked(void)
 {
@@ -553,7 +560,14 @@ static void flush_now_locked(void)
 		g.foreignSwaps++;
 		char reason[160];
 		snprintf(reason, sizeof(reason), "display taken over by someone else (swap id jumped %d -> %d)", token - delta, token);
+#if BOOTLOG_SWAP_TAKEOVER_ACTION
 		stop_locked(reason, false);
+#else
+		// Observe only: note it in the log (visible on screen and in the log file) and carry on
+		if (g.foreignSwaps <= 20) {
+			printf_locked(CAT_DOPAMINE, true, "Dopamine: %s, gap #%d, observe mode so carrying on", reason, g.foreignSwaps);
+		}
+#endif
 	}
 }
 
