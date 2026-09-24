@@ -208,6 +208,16 @@ static struct {
 	uint64_t kmsgLastPoll;
 } g;
 
+// Every swap of ours after the re-exec with how many foreign swaps happened
+// since the previous one, written to the log file only. Used to find out
+// whether the swap rate changes when the lock screen shows up.
+#define BOOTLOG_SWAP_TIMELINE_MAX 8192
+static struct {
+	uint64_t ns;
+	int foreign;
+} gSwapTimeline[BOOTLOG_SWAP_TIMELINE_MAX];
+static int gSwapTimelineCount;
+
 static pthread_mutex_t gLock = PTHREAD_MUTEX_INITIALIZER;
 
 // ---------------------------------------------------------------------------
@@ -560,6 +570,11 @@ static void flush_now_locked(void)
 	int delta = token - g.lastSwapToken;
 	bool tokensValid = (token > 0 && g.lastSwapToken > 0);
 	g.lastSwapToken = token;
+	if (g.swapIdsGlobal && !g.persist && tokensValid && delta >= 1 && delta <= 10000 && gSwapTimelineCount < BOOTLOG_SWAP_TIMELINE_MAX) {
+		gSwapTimeline[gSwapTimelineCount].ns = kernel_clock_ns();
+		gSwapTimeline[gSwapTimelineCount].foreign = delta - 1;
+		gSwapTimelineCount++;
+	}
 	if (g.swapIdsGlobal && !g.persist && tokensValid && delta >= 2 && delta <= 10000) {
 		g.foreignSwaps++;
 		char reason[160];
@@ -567,10 +582,8 @@ static void flush_now_locked(void)
 #if BOOTLOG_SWAP_TAKEOVER_ACTION
 		stop_locked(reason, false);
 #else
-		// Observe only: note it in the log (visible on screen and in the log file) and carry on
-		if (g.foreignSwaps <= 20) {
-			printf_locked(CAT_DOPAMINE, true, "Dopamine: %s, gap #%d, observe mode so carrying on", reason, g.foreignSwaps);
-		}
+		// Observe only: the swap timeline in the log file has every gap, carry on
+		(void)reason;
 #endif
 	}
 }
@@ -735,6 +748,11 @@ static void write_logfile_locked(const char *reason)
 		g.swapIdsGlobal ? "per-display counter" : "not usable for takeover detection",
 		g.firstSwapToken, g.lastSwapToken, g.foreignSwaps,
 		g.watcherAvailable ? "installed" : "not installed");
+	fprintf(f, "-- swap timeline: time of each of our swaps, foreign swaps since our previous one --\n");
+	for (int i = 0; i < gSwapTimelineCount; i++) {
+		uint64_t ns = gSwapTimeline[i].ns;
+		fprintf(f, "swap %llu.%06llu %d\n", (unsigned long long)(ns / NSEC_PER_SEC), (unsigned long long)((ns % NSEC_PER_SEC) / 1000), gSwapTimeline[i].foreign);
+	}
 	fclose(f);
 	chmod(BOOTLOG_LOGFILE_PATH, 0644);
 }
@@ -917,6 +935,7 @@ static int setup_display_locked(void)
 	g.lastSwapToken = front->lastSwapToken;
 	g.swapIdsGlobal = false;
 	g.foreignSwaps = 0;
+	gSwapTimelineCount = 0;
 	if (g.ctxCount == 2 && front->lastSwapToken > 0 && g.ctx[1]->lastSwapToken > 0) {
 		int gap = g.ctx[1]->lastSwapToken - front->lastSwapToken;
 		g.swapIdsGlobal = (gap >= 1 && gap <= 3);
