@@ -4,11 +4,13 @@
 //
 // launchd leaves BOOTLOG_ACTIVE_MARKER_PATH behind while the log is running.
 // Without it (every normal SpringBoard launch, respring, verbose boot off)
-// this tweak does nothing at all. With it, the first of these drops
-// BOOTLOG_STOP_MARKER_PATH, which launchd polls for every 25 ms:
-//  - the lock screen (CSCoverSheetViewController) is about to appear
-//  - SpringBoard commits its first frame after applicationDidFinishLaunching
-// Every event is also written to BOOTLOG_TRACE_PATH with the same clock and
+// this tweak does nothing at all. With it, BOOTLOG_STOP_MARKER_PATH is dropped
+// right before SpringBoard commits its first frame after
+// applicationDidFinishLaunching, i.e. right before the lock screen goes to
+// backboardd; launchd checks for it before every swap. The lock screen's
+// viewWillAppear: comes seconds earlier (applicationDidFinishLaunching is
+// still running and nothing has been committed yet), stopping there froze the
+// log for ~3.5 s. Every event is also written to BOOTLOG_TRACE_PATH with the same clock and
 // format as the kernel lines in bootlog.txt, so the two can be lined up.
 
 #import <UIKit/UIKit.h>
@@ -75,10 +77,11 @@ static void send_stop(const char *event)
 	trace("applicationDidFinishLaunching: end");
 
 	// Core Animation commits at kCFRunLoopBeforeWaiting with order 2000000, an
-	// observer ordered after it sees the first frame SpringBoard hands to
-	// backboardd after launching
-	CFRunLoopObserverRef observer = CFRunLoopObserverCreateWithHandler(kCFAllocatorDefault, kCFRunLoopBeforeWaiting, false, 2000001, ^(CFRunLoopObserverRef o, CFRunLoopActivity activity) {
-		send_stop("first frame committed after applicationDidFinishLaunching");
+	// observer ordered right before it runs just before SpringBoard hands its
+	// first frame after launching to backboardd. launchd stops within a few ms,
+	// the frame reaches the screen a frame or two after the commit.
+	CFRunLoopObserverRef observer = CFRunLoopObserverCreateWithHandler(kCFAllocatorDefault, kCFRunLoopBeforeWaiting, false, 1999999, ^(CFRunLoopObserverRef o, CFRunLoopActivity activity) {
+		send_stop("about to commit the first frame after applicationDidFinishLaunching");
 	});
 	CFRunLoopAddObserver(CFRunLoopGetMain(), observer, kCFRunLoopCommonModes);
 	CFRelease(observer);
@@ -90,7 +93,7 @@ static void send_stop(const char *event)
 
 - (void)viewWillAppear:(BOOL)animated
 {
-	send_stop("lock screen viewWillAppear");
+	trace("lock screen viewWillAppear");
 	%orig;
 }
 
