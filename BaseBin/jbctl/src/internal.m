@@ -4,6 +4,8 @@
 #import <sys/mount.h>
 #import <notify.h>
 #import <mach/mach_time.h>
+#import <libproc.h>
+#import <sys/proc_info.h>
 #import <libjailbreak/stock_fixes.h>
 
 // Companion of the verbose boot log in launchdhook (bootlog.c), paths must
@@ -22,6 +24,13 @@
 #define BOOTLOG_WATCH_EXIT_WRITE_FAILED 12
 
 static FILE *gBootlogTrace;
+
+static double continuous_seconds(uint64_t t)
+{
+	static mach_timebase_info_data_t timebase;
+	if (timebase.denom == 0) mach_timebase_info(&timebase);
+	return (double)(t * timebase.numer / timebase.denom) / NSEC_PER_SEC;
+}
 
 // Same clock and format as the kernel lines in bootlog.txt, so both line up
 static void bootlog_trace(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -128,8 +137,26 @@ static int bootlog_watch_run(void)
 // boot log is active.
 static int bootlog_watch(void)
 {
+	uint64_t beforeMkdir = mach_continuous_time();
 	mkdir("/var/mobile/Library/Logs/Dopamine", 0755);
+	uint64_t beforeOpen = mach_continuous_time();
 	gBootlogTrace = fopen(BOOTLOG_WATCH_TRACE_PATH, "w");
+	uint64_t afterOpen = mach_continuous_time();
+
+	// Where the time between launchd's spawn and us getting here went. The
+	// process start time is wall clock, turn it into seconds on our clock.
+	struct proc_bsdinfo info;
+	double started = -1;
+	if (proc_pidinfo(getpid(), PROC_PIDTBSDINFO, 0, &info, sizeof(info)) == sizeof(info)) {
+		struct timeval now;
+		gettimeofday(&now, NULL);
+		double ago = (now.tv_sec - (double)info.pbi_start_tvsec) + (now.tv_usec - (double)info.pbi_start_tvusec) / 1e6;
+		started = continuous_seconds(mach_continuous_time()) - ago;
+	}
+	bootlog_trace("timing: process created %.3f, jbctl constructor %.3f, main %.3f, mkdir %.3f, fopen %.3f -> %.3f",
+		started, continuous_seconds(gJbctlConstructorTime), continuous_seconds(gJbctlMainTime),
+		continuous_seconds(beforeMkdir), continuous_seconds(beforeOpen), continuous_seconds(afterOpen));
+
 	int r = bootlog_watch_run();
 	bootlog_trace("exiting with %d", r);
 	if (gBootlogTrace) {

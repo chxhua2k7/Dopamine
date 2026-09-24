@@ -3,6 +3,7 @@
 #import <libjailbreak/jbclient_mach.h>
 #import <libjailbreak/stock_fixes.h>
 #import "internal.h"
+#import <mach/mach_time.h>
 
 #import <Foundation/Foundation.h>
 #import <CoreServices/LSApplicationProxy.h>
@@ -23,8 +24,17 @@ Available commands:\n\
 	update <tipa/basebin/tarball> <path>\tInitiates a jailbreak update either based on a TIPA, based on a basebin.tar file or based on a standalone tarball, TIPA installation depends on TrollStore, afterwards it triggers a userspace reboot\n");
 }
 
+uint64_t gJbctlConstructorTime;
+uint64_t gJbctlMainTime;
+
+__attribute__((constructor)) static void record_constructor_time(void)
+{
+	gJbctlConstructorTime = mach_continuous_time();
+}
+
 int main(int argc, char* argv[])
 {
+	gJbctlMainTime = mach_continuous_time();
 	if (!strcmp(argv[argc-1], "earlyboot")) {
 		// If jbctl is spawned in "early boot" state, the jbserver port needs to be obtained from registeredPorts[0] instead
 		mach_port_t *registeredPorts;
