@@ -51,7 +51,7 @@ static proc_kmsgbuf_t resolve_proc_kmsgbuf(void)
 // Where the complete log of the last userspace reboot ends up. The state files
 // below live here too: /private/var/tmp (= /tmp) is emptied by dirs_cleaner,
 // which launchd execs a few hundred ms after the re-exec, so anything put
-// there would be gone before the bootlog daemon gets to look for it.
+// there would be gone before SpringBoard gets to look for it.
 #define BOOTLOG_LOGFILE_DIR "/var/mobile/Library/Logs/Dopamine"
 #define BOOTLOG_LOGFILE_PATH BOOTLOG_LOGFILE_DIR "/bootlog.txt"
 
@@ -79,23 +79,25 @@ static proc_kmsgbuf_t resolve_proc_kmsgbuf(void)
 // backboardd owns the display once it is up, but it does not put anything on
 // screen until SpringBoard has rendered its first frame (seconds later). Until
 // then our swaps are harmless, so the log keeps scrolling through the whole
-// SpringBoard launch. The moment SpringBoard is done launching has to be
-// observed from a normal process (launchd can't use libnotify), which is what
-// the com.opa334.Dopamine.bootlog launch daemon (`jbctl internal bootlog_watch`)
-// does: it waits for SpringBoard's "finished launching" notification and then
-// drops BOOTLOG_STOP_MARKER_PATH, which launchd polls for.
+// SpringBoard launch. Only SpringBoard itself knows when its lock screen is
+// about to show up, so the BootLogStop tweak (Tweak/BootLogStop in this repo)
+// drops BOOTLOG_STOP_MARKER_PATH from inside SpringBoard at that moment, and
+// launchd polls for it. A launch daemon doing this didn't work out: on the
+// device it only got to run after the first unlock (55-100 s after launchd
+// spawned it), long after the lock screen was up.
 //
-// If that daemon is not installed, the log falls back to stopping as soon as
-// backboardd is spawned. If it is installed but never reports back, the hard
-// cap below stops the log some seconds after backboardd was spawned.
-#define BOOTLOG_WATCHER_PLIST_RELPATH "/basebin/LaunchDaemons/com.opa334.Dopamine.bootlog.plist"
-// Keep in sync with jbctl/src/internal.m
+// If the tweak is not installed, the log falls back to stopping as soon as
+// backboardd is spawned. If it is installed but never reports back (tweak
+// injection off, hook didn't fire), the hard cap below stops the log some
+// seconds after backboardd was spawned.
+#define BOOTLOG_STOPPER_TWEAK_RELPATH "/Library/MobileSubstrate/DynamicLibraries/BootLogStop.dylib"
+// Keep in sync with Tweak/BootLogStop
 #define BOOTLOG_ACTIVE_MARKER_PATH BOOTLOG_LOGFILE_DIR "/.bootlog_active"
 #define BOOTLOG_STOP_MARKER_PATH BOOTLOG_LOGFILE_DIR "/.bootlog_stop"
 #define BOOTLOG_STOP_MARKER_POLL_MS 25
 #define BOOTLOG_BACKBOARDD_HARD_CAP_MS 20000
 
-// Second line of defense, independent of any daemon: the swap ids that
+// Second line of defense, independent of the tweak: the swap ids that
 // IOMobileFramebufferSwapBegin hands out are a per-display counter. As long as
 // only we swap, every swap of ours gets the previous id + 1. The moment
 // backboardd presents SpringBoard's first frame, our next swap sees a gap, and
@@ -194,7 +196,7 @@ static struct {
 
 	bool dirty;           // shadow buffer needs re-rendering
 	bool flushPending;    // a deferred flush is scheduled
-	bool watcherAvailable; // the bootlog launch daemon is installed and will tell us when SpringBoard is up
+	bool watcherAvailable; // the BootLogStop tweak is installed and will tell us when SpringBoard is up
 	bool hardCapArmed;    // backboardd was spawned, the hard cap timer is running
 	uint64_t lastFlush;
 
@@ -744,7 +746,7 @@ static void write_logfile_locked(const char *reason)
 	if (reason) {
 		fprintf(f, "\n-- bootlog stopped: %s --\n", reason);
 	}
-	fprintf(f, "-- swap ids: %s (first %d, last %d, gaps seen %d); bootlog daemon %s --\n",
+	fprintf(f, "-- swap ids: %s (first %d, last %d, gaps seen %d); BootLogStop tweak %s --\n",
 		g.swapIdsGlobal ? "per-display counter" : "not usable for takeover detection",
 		g.firstSwapToken, g.lastSwapToken, g.foreignSwaps,
 		g.watcherAvailable ? "installed" : "not installed");
@@ -1026,13 +1028,13 @@ static void arm_backboardd_hard_cap_locked(void)
 	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)BOOTLOG_BACKBOARDD_HARD_CAP_MS * (int64_t)NSEC_PER_MSEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
 		pthread_mutex_lock(&gLock);
 		if (g.active && g.generation == generation) {
-			stop_locked("hard cap after backboardd spawn, the bootlog daemon never reported SpringBoard", false);
+			stop_locked("hard cap after backboardd spawn, the BootLogStop tweak never reported SpringBoard", false);
 		}
 		pthread_mutex_unlock(&gLock);
 	});
 }
 
-// Polls for the marker the bootlog daemon drops once SpringBoard finished launching
+// Polls for the marker the BootLogStop tweak drops when the lock screen is about to show
 static void poll_stop_marker(uint32_t generation)
 {
 	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)BOOTLOG_STOP_MARKER_POLL_MS * (int64_t)NSEC_PER_MSEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
@@ -1042,7 +1044,7 @@ static void poll_stop_marker(uint32_t generation)
 			return;
 		}
 		if (access(BOOTLOG_STOP_MARKER_PATH, F_OK) == 0) {
-			char reason[256] = "bootlog daemon asked us to stop";
+			char reason[256] = "BootLogStop tweak asked us to stop";
 			FILE *f = fopen(BOOTLOG_STOP_MARKER_PATH, "r");
 			if (f) {
 				char line[256];
@@ -1063,7 +1065,7 @@ static void poll_stop_marker(uint32_t generation)
 }
 
 // Called once in the re-executed launchd: figures out whether the bootlog
-// launch daemon is there and, if so, starts waiting for its signal
+// tweak is there and, if so, starts waiting for its signal
 static void setup_springboard_watch_locked(void)
 {
 	unlink(BOOTLOG_STOP_MARKER_PATH);
@@ -1071,14 +1073,17 @@ static void setup_springboard_watch_locked(void)
 
 	const char *rootPath = jbinfo(rootPath);
 	if (!rootPath) return;
-	char plistPath[PATH_MAX];
-	snprintf(plistPath, sizeof(plistPath), "%s%s", rootPath, BOOTLOG_WATCHER_PLIST_RELPATH);
-	if (access(plistPath, F_OK) != 0) {
-		printf_locked(CAT_DOPAMINE, true, "Dopamine: bootlog daemon not installed, log will stop when backboardd starts");
+	char tweakPath[PATH_MAX];
+	snprintf(tweakPath, sizeof(tweakPath), "%s%s", rootPath, BOOTLOG_STOPPER_TWEAK_RELPATH);
+	if (access(tweakPath, F_OK) != 0) {
+		printf_locked(CAT_DOPAMINE, true, "Dopamine: BootLogStop tweak not installed, log will stop when backboardd starts");
 		return;
 	}
 
-	// Tell the daemon that there is a log to stop this boot
+	// SpringBoard runs as mobile and has to be able to drop the stop marker here
+	chown(BOOTLOG_LOGFILE_DIR, 501, 501);
+
+	// Tell the tweak that there is a log to stop this boot
 	int fd = open(BOOTLOG_ACTIVE_MARKER_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 	if (fd < 0) return;
 	close(fd);
@@ -1150,7 +1155,7 @@ int bootlog_start(bool beforeUserspaceReboot)
 	g.persist = beforeUserspaceReboot;
 	g.dirty = true;
 
-	// Holds the persisted log and the daemon markers, has to exist before either is written
+	// Holds the persisted log and the tweak markers, has to exist before either is written
 	mkdir(BOOTLOG_LOGFILE_DIR, 0755);
 
 	bool restored = false;
@@ -1243,7 +1248,7 @@ void bootlog_spawn_event(const char *path, char *const argv[])
 		}
 
 		// backboardd owns the display from here on, but shows nothing until
-		// SpringBoard is done launching. With the bootlog daemon around we keep
+		// SpringBoard is done launching. With the BootLogStop tweak around we keep
 		// going until it reports that moment (hard cap as a safety net),
 		// without it this is where we have to stop.
 		bool backboardd = !strcmp(label, "com.apple.backboardd") || !strcmp(path, "/usr/libexec/backboardd");

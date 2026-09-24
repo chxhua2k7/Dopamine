@@ -96,7 +96,7 @@ int main(int argc, char **argv) {
 	usleep(60000);
 	char *bb[] = { "/usr/libexec/xpcproxy", "com.apple.backboardd\n", NULL };
 	bootlog_spawn_event("/usr/libexec/xpcproxy", bb);
-	int watcher = access("/var/jb/basebin/LaunchDaemons/com.opa334.Dopamine.bootlog.plist", F_OK) == 0;
+	int watcher = access("/var/jb/Library/MobileSubstrate/DynamicLibraries/BootLogStop.dylib", F_OK) == 0;
 	if (watcher) {
 		// With the daemon installed the log must keep going after backboardd...
 		if (!bootlog_is_active()) { fprintf(stderr, "STOPPED ON BACKBOARDD DESPITE WATCHER\n"); return 1; }

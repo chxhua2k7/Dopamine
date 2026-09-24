@@ -6,8 +6,8 @@
 set -e
 SRC=BaseBin/launchdhook/src
 HERE=$(dirname "$0")
-mkdir -p /var/mobile/Library/Logs/Dopamine /var/jb/basebin/LaunchDaemons
-touch /var/jb/basebin/LaunchDaemons/com.opa334.Dopamine.bootlog.plist   # "daemon installed" case; rm it to test the fallback
+mkdir -p /var/mobile/Library/Logs/Dopamine /var/jb/Library/MobileSubstrate/DynamicLibraries
+touch /var/jb/Library/MobileSubstrate/DynamicLibraries/BootLogStop.dylib   # "tweak installed" case; rm it to test the fallback
 clang -std=gnu11 -fblocks -Wall -Wextra -Wno-unused-parameter -I"$HERE/stubs" -I"$SRC" \
   -o "$HERE/test_driver" "$HERE/test_driver.c" "$SRC/bootlog.c" -lBlocksRuntime -lpthread
 # args: rotation width height spawnCount ; FOREIGN=1 simulates backboardd presenting a frame

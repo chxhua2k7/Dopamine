@@ -18,10 +18,10 @@
 //
 // Redraws are coalesced (at most one framebuffer swap every few dozen ms).
 // The log keeps scrolling through the whole SpringBoard launch and stops right
-// before SpringBoard shows its first frame: the com.opa334.Dopamine.bootlog
-// launch daemon (`jbctl internal bootlog_watch`) waits for SpringBoard's
-// "finished launching" notification and drops a marker file that launchd polls
-// for. Without that daemon the log stops as soon as backboardd is spawned, and
+// before SpringBoard shows its first frame: the BootLogStop tweak drops a
+// marker file from inside SpringBoard when the lock screen is about to appear,
+// and launchd polls for it. Without that tweak the log stops as soon as
+// backboardd is spawned, and
 // a hard cap plus a watchdog make sure it can never keep painting over the
 // home screen.
 //
@@ -61,7 +61,7 @@ void bootlog_dopamine_printf(const char *fmt, ...) __attribute__((format(printf,
 // Log a process launch. `path` is the executable that was spawned, `argv` is
 // its argument vector (used to extract the launchd label from xpcproxy).
 // Also pulls any new kernel messages onto the screen first. Spawning backboardd
-// either stops the log (no bootlog daemon) or arms the hard cap.
+// either stops the log (no BootLogStop tweak) or arms the hard cap.
 void bootlog_spawn_event(const char *path, char *const argv[]);
 
 // Stop the log, release the framebuffer and write the log file.
