@@ -3,27 +3,58 @@
 #import <libjailbreak/libjailbreak.h>
 #import <sys/mount.h>
 #import <notify.h>
+#import <mach/mach_time.h>
 #import <libjailbreak/stock_fixes.h>
 
 // Companion of the verbose boot log in launchdhook (bootlog.c), paths must
 // match. Not in /private/var/tmp: dirs_cleaner empties it during boot.
 #define BOOTLOG_ACTIVE_MARKER_PATH "/var/mobile/Library/Logs/Dopamine/.bootlog_active"
 #define BOOTLOG_STOP_MARKER_PATH "/var/mobile/Library/Logs/Dopamine/.bootlog_stop"
+// What the daemon did on the last boot, overwritten every time it runs
+#define BOOTLOG_WATCH_TRACE_PATH "/var/mobile/Library/Logs/Dopamine/bootlog_watch.txt"
 #define BOOTLOG_WATCH_TIMEOUT_SECONDS 60
 // An active marker older than this was left behind by an earlier boot
 #define BOOTLOG_ACTIVE_MARKER_MAX_AGE 180
 
-// launchd cannot use libnotify itself, so this (spawned by the
-// com.opa334.Dopamine.bootlog launch daemon on every userspace boot) waits for
-// SpringBoard to report that it finished launching and then drops a marker
-// file that tells launchdhook to stop drawing the boot log, right before
-// SpringBoard puts its first frame on screen. Returns immediately when no
-// boot log is active.
-static int bootlog_watch(void)
+// Exit codes, visible as "last exit code" in launchctl print
+#define BOOTLOG_WATCH_EXIT_NO_MARKER 10
+#define BOOTLOG_WATCH_EXIT_STALE_MARKER 11
+#define BOOTLOG_WATCH_EXIT_WRITE_FAILED 12
+
+static FILE *gBootlogTrace;
+
+// Same clock and format as the kernel lines in bootlog.txt, so both line up
+static void bootlog_trace(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void bootlog_trace(const char *fmt, ...)
 {
+	if (!gBootlogTrace) return;
+	static mach_timebase_info_data_t timebase;
+	if (timebase.denom == 0) mach_timebase_info(&timebase);
+	uint64_t ns = mach_continuous_time() * timebase.numer / timebase.denom;
+	fprintf(gBootlogTrace, "[%5llu.%06llu] ", ns / NSEC_PER_SEC, (ns % NSEC_PER_SEC) / NSEC_PER_USEC);
+	va_list va;
+	va_start(va, fmt);
+	vfprintf(gBootlogTrace, fmt, va);
+	va_end(va);
+	fputc('\n', gBootlogTrace);
+	fflush(gBootlogTrace);
+}
+
+static int bootlog_watch_run(void)
+{
+	bootlog_trace("bootlog_watch started (pid %d, uid %d, euid %d)", getpid(), getuid(), geteuid());
+
 	struct stat st;
-	if (stat(BOOTLOG_ACTIVE_MARKER_PATH, &st) != 0) return 0;
-	if (time(NULL) - st.st_mtime > BOOTLOG_ACTIVE_MARKER_MAX_AGE) return 0;
+	if (stat(BOOTLOG_ACTIVE_MARKER_PATH, &st) != 0) {
+		bootlog_trace("no active marker (errno %d: %s), nothing to do", errno, strerror(errno));
+		return BOOTLOG_WATCH_EXIT_NO_MARKER;
+	}
+	long age = (long)(time(NULL) - st.st_mtime);
+	bootlog_trace("active marker found, %ld s old", age);
+	if (age > BOOTLOG_ACTIVE_MARKER_MAX_AGE) {
+		bootlog_trace("active marker is stale, nothing to do");
+		return BOOTLOG_WATCH_EXIT_STALE_MARKER;
+	}
 
 	// Serial queue so the callbacks below can't race each other
 	dispatch_queue_t queue = dispatch_queue_create("com.opa334.Dopamine.bootlog.watch", DISPATCH_QUEUE_SERIAL);
@@ -48,16 +79,19 @@ static int bootlog_watch(void)
 		tokens[i] = 0;
 		int token = 0;
 		uint32_t r = notify_register_dispatch(name, &token, queue, ^(int t) {
+			bootlog_trace("notification %s", name);
 			[seen appendFormat:@"%s@%.3fs ", name, [[NSDate date] timeIntervalSinceDate:start]];
 			if (stops && !stopReason) {
 				stopReason = [NSString stringWithFormat:@"SpringBoard finished launching (%s)", name];
 				dispatch_semaphore_signal(done);
 			}
 		});
+		bootlog_trace("registered %s: status %u", name, r);
 		if (r == NOTIFY_STATUS_OK) tokens[i] = token;
 	}
 
 	long waitResult = dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, (int64_t)BOOTLOG_WATCH_TIMEOUT_SECONDS * (int64_t)NSEC_PER_SEC));
+	bootlog_trace("wait finished: %s", waitResult == 0 ? "signalled" : "timed out");
 	for (size_t i = 0; i < count; i++) {
 		if (tokens[i]) notify_cancel(tokens[i]);
 	}
@@ -69,10 +103,40 @@ static int bootlog_watch(void)
 	});
 
 	// Write atomically, launchd polls for this file
-	NSString *tmpPath = @BOOTLOG_STOP_MARKER_PATH ".tmp";
-	[[reason stringByAppendingString:@"\n"] writeToFile:tmpPath atomically:NO encoding:NSUTF8StringEncoding error:nil];
-	rename(tmpPath.fileSystemRepresentation, BOOTLOG_STOP_MARKER_PATH);
+	const char *tmpPath = BOOTLOG_STOP_MARKER_PATH ".tmp";
+	const char *line = [reason stringByAppendingString:@"\n"].UTF8String;
+	int fd = open(tmpPath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (fd < 0) {
+		bootlog_trace("can't create %s (errno %d: %s)", tmpPath, errno, strerror(errno));
+		return BOOTLOG_WATCH_EXIT_WRITE_FAILED;
+	}
+	write(fd, line, strlen(line));
+	close(fd);
+	if (rename(tmpPath, BOOTLOG_STOP_MARKER_PATH) != 0) {
+		bootlog_trace("can't rename stop marker into place (errno %d: %s)", errno, strerror(errno));
+		return BOOTLOG_WATCH_EXIT_WRITE_FAILED;
+	}
+	bootlog_trace("stop marker written: %s", reason.UTF8String);
 	return 0;
+}
+
+// launchd cannot use libnotify itself, so this (spawned by the
+// com.opa334.Dopamine.bootlog launch daemon on every userspace boot) waits for
+// SpringBoard to report that it finished launching and then drops a marker
+// file that tells launchdhook to stop drawing the boot log, right before
+// SpringBoard puts its first frame on screen. Returns immediately when no
+// boot log is active.
+static int bootlog_watch(void)
+{
+	mkdir("/var/mobile/Library/Logs/Dopamine", 0755);
+	gBootlogTrace = fopen(BOOTLOG_WATCH_TRACE_PATH, "w");
+	int r = bootlog_watch_run();
+	bootlog_trace("exiting with %d", r);
+	if (gBootlogTrace) {
+		fclose(gBootlogTrace);
+		gBootlogTrace = NULL;
+	}
+	return r;
 }
 
 SInt32 CFUserNotificationDisplayAlert(CFTimeInterval timeout, CFOptionFlags flags, CFURLRef iconURL, CFURLRef soundURL, CFURLRef localizationURL, CFStringRef alertHeader, CFStringRef alertMessage, CFStringRef defaultButtonTitle, CFStringRef alternateButtonTitle, CFStringRef otherButtonTitle, CFOptionFlags *responseFlags) API_AVAILABLE(ios(3.0));
