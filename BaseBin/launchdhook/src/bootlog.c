@@ -552,9 +552,33 @@ static void render_all(void)
 static void stop_locked(const char *reason, bool finalFlush);
 static void printf_locked(char category, bool timestamp, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
 
+// If the BootLogStop tweak dropped its marker, stops the log (without another
+// swap, the lock screen may already be up) and returns true. `via` ends up in
+// the log file, it tells which path noticed the marker first.
+static bool stop_if_marker_locked(const char *via)
+{
+	if (!g.watcherAvailable || access(BOOTLOG_STOP_MARKER_PATH, F_OK) != 0) return false;
+	char reason[256] = "BootLogStop tweak asked us to stop";
+	FILE *f = fopen(BOOTLOG_STOP_MARKER_PATH, "r");
+	if (f) {
+		char line[200];
+		if (fgets(line, sizeof(line), f)) {
+			size_t len = strlen(line);
+			while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = '\0';
+			if (len > 0) snprintf(reason, sizeof(reason), "%s (seen by %s)", line, via);
+		}
+		fclose(f);
+	}
+	stop_locked(reason, false);
+	return true;
+}
+
 static void flush_now_locked(void)
 {
 	if (g.ctxCount == 0 || !g.shadow) return;
+	// Checked right before swapping: the timer based poll can lag by seconds
+	// while the system is busy booting, the swaps themselves keep coming
+	if (stop_if_marker_locked("flush")) return;
 	if (g.dirty) render_all();
 	// Always draw into the surface that is *not* currently on screen, so the
 	// display never scans out a half copied frame
@@ -605,7 +629,7 @@ static void request_flush_locked(void)
 
 	uint32_t generation = g.generation;
 	uint64_t delay = BOOTLOG_FLUSH_INTERVAL_NS - elapsed;
-	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)delay), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)delay), dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
 		pthread_mutex_lock(&gLock);
 		if (g.active && g.generation == generation) {
 			g.flushPending = false;
@@ -1025,7 +1049,7 @@ static void arm_backboardd_hard_cap_locked(void)
 	if (g.hardCapArmed) return;
 	g.hardCapArmed = true;
 	uint32_t generation = g.generation;
-	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)BOOTLOG_BACKBOARDD_HARD_CAP_MS * (int64_t)NSEC_PER_MSEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)BOOTLOG_BACKBOARDD_HARD_CAP_MS * (int64_t)NSEC_PER_MSEC), dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
 		pthread_mutex_lock(&gLock);
 		if (g.active && g.generation == generation) {
 			stop_locked("hard cap after backboardd spawn, the BootLogStop tweak never reported SpringBoard", false);
@@ -1034,28 +1058,18 @@ static void arm_backboardd_hard_cap_locked(void)
 	});
 }
 
-// Polls for the marker the BootLogStop tweak drops when the lock screen is about to show
+// Polls for the marker the BootLogStop tweak drops when the lock screen is about
+// to show. flush_now_locked checks it before every swap as well, this poll only
+// covers the case that nothing new gets logged for a while.
 static void poll_stop_marker(uint32_t generation)
 {
-	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)BOOTLOG_STOP_MARKER_POLL_MS * (int64_t)NSEC_PER_MSEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)BOOTLOG_STOP_MARKER_POLL_MS * (int64_t)NSEC_PER_MSEC), dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
 		pthread_mutex_lock(&gLock);
 		if (!g.active || g.generation != generation) {
 			pthread_mutex_unlock(&gLock);
 			return;
 		}
-		if (access(BOOTLOG_STOP_MARKER_PATH, F_OK) == 0) {
-			char reason[256] = "BootLogStop tweak asked us to stop";
-			FILE *f = fopen(BOOTLOG_STOP_MARKER_PATH, "r");
-			if (f) {
-				char line[256];
-				if (fgets(line, sizeof(line), f)) {
-					size_t len = strlen(line);
-					while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = '\0';
-					if (len > 0) strlcpy(reason, line, sizeof(reason));
-				}
-				fclose(f);
-			}
-			stop_locked(reason, false);
+		if (stop_if_marker_locked("poll")) {
 			pthread_mutex_unlock(&gLock);
 			return;
 		}
@@ -1121,7 +1135,7 @@ static void print_header_locked(void)
 static void arm_watchdog_locked(void)
 {
 	uint32_t generation = g.generation;
-	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)BOOTLOG_WATCHDOG_SECONDS * (int64_t)NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)BOOTLOG_WATCHDOG_SECONDS * (int64_t)NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
 		pthread_mutex_lock(&gLock);
 		if (g.active && g.generation == generation) {
 			stop_locked("watchdog timeout", false);
