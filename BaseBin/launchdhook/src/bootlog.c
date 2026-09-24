@@ -48,14 +48,17 @@ static proc_kmsgbuf_t resolve_proc_kmsgbuf(void)
 // Lines kept for the log file (oldest are dropped beyond this)
 #define BOOTLOG_MAX_HISTORY 4096
 
-// Where the log is stashed across the launchd re-exec
-#define BOOTLOG_PERSIST_PATH "/private/var/tmp/.dopamine_bootlog"
-// Ignore a stashed log older than this (seconds), it is from another boot
-#define BOOTLOG_PERSIST_MAX_AGE 180
-
-// Where the complete log of the last userspace reboot ends up
+// Where the complete log of the last userspace reboot ends up. The state files
+// below live here too: /private/var/tmp (= /tmp) is emptied by dirs_cleaner,
+// which launchd execs a few hundred ms after the re-exec, so anything put
+// there would be gone before the bootlog daemon gets to look for it.
 #define BOOTLOG_LOGFILE_DIR "/var/mobile/Library/Logs/Dopamine"
 #define BOOTLOG_LOGFILE_PATH BOOTLOG_LOGFILE_DIR "/bootlog.txt"
+
+// Where the log is stashed across the launchd re-exec
+#define BOOTLOG_PERSIST_PATH BOOTLOG_LOGFILE_DIR "/.bootlog_persist"
+// Ignore a stashed log older than this (seconds), it is from another boot
+#define BOOTLOG_PERSIST_MAX_AGE 180
 
 // Size of the buffer used to read the kernel message buffer
 #define BOOTLOG_KMSG_BUFSIZE (256 * 1024)
@@ -86,8 +89,9 @@ static proc_kmsgbuf_t resolve_proc_kmsgbuf(void)
 // backboardd is spawned. If it is installed but never reports back, the hard
 // cap below stops the log some seconds after backboardd was spawned.
 #define BOOTLOG_WATCHER_PLIST_RELPATH "/basebin/LaunchDaemons/com.opa334.Dopamine.bootlog.plist"
-#define BOOTLOG_ACTIVE_MARKER_PATH "/private/var/tmp/.dopamine_bootlog_active"
-#define BOOTLOG_STOP_MARKER_PATH "/private/var/tmp/.dopamine_bootlog_stop"
+// Keep in sync with jbctl/src/internal.m
+#define BOOTLOG_ACTIVE_MARKER_PATH BOOTLOG_LOGFILE_DIR "/.bootlog_active"
+#define BOOTLOG_STOP_MARKER_PATH BOOTLOG_LOGFILE_DIR "/.bootlog_stop"
 #define BOOTLOG_STOP_MARKER_POLL_MS 25
 #define BOOTLOG_BACKBOARDD_HARD_CAP_MS 20000
 
@@ -1126,6 +1130,9 @@ int bootlog_start(bool beforeUserspaceReboot)
 	g.active = true;
 	g.persist = beforeUserspaceReboot;
 	g.dirty = true;
+
+	// Holds the persisted log and the daemon markers, has to exist before either is written
+	mkdir(BOOTLOG_LOGFILE_DIR, 0755);
 
 	bool restored = false;
 	if (!beforeUserspaceReboot) {

@@ -5,10 +5,13 @@
 #import <notify.h>
 #import <libjailbreak/stock_fixes.h>
 
-// Companion of the verbose boot log in launchdhook (bootlog.c)
-#define BOOTLOG_ACTIVE_MARKER_PATH "/private/var/tmp/.dopamine_bootlog_active"
-#define BOOTLOG_STOP_MARKER_PATH "/private/var/tmp/.dopamine_bootlog_stop"
+// Companion of the verbose boot log in launchdhook (bootlog.c), paths must
+// match. Not in /private/var/tmp: dirs_cleaner empties it during boot.
+#define BOOTLOG_ACTIVE_MARKER_PATH "/var/mobile/Library/Logs/Dopamine/.bootlog_active"
+#define BOOTLOG_STOP_MARKER_PATH "/var/mobile/Library/Logs/Dopamine/.bootlog_stop"
 #define BOOTLOG_WATCH_TIMEOUT_SECONDS 60
+// An active marker older than this was left behind by an earlier boot
+#define BOOTLOG_ACTIVE_MARKER_MAX_AGE 180
 
 // launchd cannot use libnotify itself, so this (spawned by the
 // com.opa334.Dopamine.bootlog launch daemon on every userspace boot) waits for
@@ -18,7 +21,9 @@
 // boot log is active.
 static int bootlog_watch(void)
 {
-	if (access(BOOTLOG_ACTIVE_MARKER_PATH, F_OK) != 0) return 0;
+	struct stat st;
+	if (stat(BOOTLOG_ACTIVE_MARKER_PATH, &st) != 0) return 0;
+	if (time(NULL) - st.st_mtime > BOOTLOG_ACTIVE_MARKER_MAX_AGE) return 0;
 
 	// Serial queue so the callbacks below can't race each other
 	dispatch_queue_t queue = dispatch_queue_create("com.opa334.Dopamine.bootlog.watch", DISPATCH_QUEUE_SERIAL);

@@ -6,7 +6,7 @@
 set -e
 SRC=BaseBin/launchdhook/src
 HERE=$(dirname "$0")
-mkdir -p /private/var/tmp /var/mobile/Library/Logs /var/jb/basebin/LaunchDaemons
+mkdir -p /var/mobile/Library/Logs/Dopamine /var/jb/basebin/LaunchDaemons
 touch /var/jb/basebin/LaunchDaemons/com.opa334.Dopamine.bootlog.plist   # "daemon installed" case; rm it to test the fallback
 clang -std=gnu11 -fblocks -Wall -Wextra -Wno-unused-parameter -I"$HERE/stubs" -I"$SRC" \
   -o "$HERE/test_driver" "$HERE/test_driver.c" "$SRC/bootlog.c" -lBlocksRuntime -lpthread

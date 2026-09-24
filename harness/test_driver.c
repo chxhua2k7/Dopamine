@@ -72,7 +72,7 @@ static void dump_ppm(const char *path) {
 int main(int argc, char **argv) {
 	if (argc > 1) gRotation = atoi(argv[1]);
 	if (argc > 3) { gW = atoi(argv[2]); gH = atoi(argv[3]); }
-	unlink("/private/var/tmp/.dopamine_bootlog"); (void)gCtxs;
+	unlink("/var/mobile/Library/Logs/Dopamine/.bootlog_persist"); (void)gCtxs;
 	// phase 1
 	if (bootlog_start(true) != 0) { fprintf(stderr, "start failed\n"); return 1; }
 	bootlog_printf("launchd[1]: re-executing /sbin/launchd");
@@ -100,7 +100,7 @@ int main(int argc, char **argv) {
 	if (watcher) {
 		// With the daemon installed the log must keep going after backboardd...
 		if (!bootlog_is_active()) { fprintf(stderr, "STOPPED ON BACKBOARDD DESPITE WATCHER\n"); return 1; }
-		if (access("/private/var/tmp/.dopamine_bootlog_active", F_OK) != 0) { fprintf(stderr, "NO ACTIVE MARKER\n"); return 1; }
+		if (access("/var/mobile/Library/Logs/Dopamine/.bootlog_active", F_OK) != 0) { fprintf(stderr, "NO ACTIVE MARKER\n"); return 1; }
 		for (int i = 0; i < 30; i++) {
 			char label[64]; snprintf(label, sizeof(label), "com.apple.late%d\n", i);
 			char *a[] = { "/usr/libexec/xpcproxy", label, NULL };
@@ -115,16 +115,16 @@ int main(int argc, char **argv) {
 			bootlog_printf("line after a foreign swap");
 			usleep(20000);
 			if (!bootlog_is_active()) { fprintf(stderr, "OBSERVE MODE STOPPED THE LOG\n"); return 1; }
-			FILE *m2 = fopen("/private/var/tmp/.dopamine_bootlog_stop", "w"); fputs("SpringBoard finished launching (test)\n", m2); fclose(m2);
+			FILE *m2 = fopen("/var/mobile/Library/Logs/Dopamine/.bootlog_stop", "w"); fputs("SpringBoard finished launching (test)\n", m2); fclose(m2);
 			usleep(150000);
 		}
 		else {
 			// ...until the daemon drops the marker
-			FILE *m = fopen("/private/var/tmp/.dopamine_bootlog_stop", "w"); fputs("SpringBoard finished launching (test)\n", m); fclose(m);
+			FILE *m = fopen("/var/mobile/Library/Logs/Dopamine/.bootlog_stop", "w"); fputs("SpringBoard finished launching (test)\n", m); fclose(m);
 			usleep(150000);
 		}
 		if (bootlog_is_active()) { fprintf(stderr, "MARKER IGNORED\n"); return 1; }
-		if (access("/private/var/tmp/.dopamine_bootlog_active", F_OK) == 0) { fprintf(stderr, "ACTIVE MARKER LEFT BEHIND\n"); return 1; }
+		if (access("/var/mobile/Library/Logs/Dopamine/.bootlog_active", F_OK) == 0) { fprintf(stderr, "ACTIVE MARKER LEFT BEHIND\n"); return 1; }
 	}
 	else {
 		if (bootlog_is_active()) { fprintf(stderr, "DID NOT STOP ON BACKBOARDD WITHOUT WATCHER\n"); return 1; }
